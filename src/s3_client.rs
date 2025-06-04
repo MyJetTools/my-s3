@@ -14,7 +14,8 @@ impl S3Client {
     ) -> Result<(), String> {
         let fl_url = flurl::FlUrl::new(self.endpoint.as_str())
             .append_path_segment(bucket_name)
-            .append_path_segment(key);
+            .append_path_segment(key)
+            .with_retries(3);
 
         let fl_url = super::utils::populate_headers(
             self,
@@ -45,7 +46,9 @@ impl S3Client {
     }
 
     pub async fn create_bucket(&self, bucket_name: &str) -> Result<(), String> {
-        let fl_url = flurl::FlUrl::new(self.endpoint.as_str()).append_path_segment(bucket_name);
+        let fl_url = flurl::FlUrl::new(self.endpoint.as_str())
+            .append_path_segment(bucket_name)
+            .with_retries(3);
 
         let fl_url =
             super::utils::populate_headers(self, fl_url, "PUT", bucket_name, None, [].as_slice())?;
