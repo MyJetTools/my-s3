@@ -1,0 +1,18 @@
+[package]
+name = "my-s3"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "*", features = ["full"] }
+rust-extensions = { tag = "0.1.5", git = "https://github.com/MyJetTools/rust-extensions.git", features = [
+    "with-tokio",
+] }
+async-trait = "*"
+uuid = "*"
+
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+
+flurl = { tag = "0.6.1", git = "https://github.com/MyJetTools/fl-url.git" }
