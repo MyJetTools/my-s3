@@ -45,12 +45,7 @@ impl S3Client {
         Err(err)
     }
 
-    pub async fn download_file(
-        &self,
-        bucket_name: &str,
-        key: &str,
-        content: Vec<u8>,
-    ) -> Result<Vec<u8>, String> {
+    pub async fn download_file(&self, bucket_name: &str, key: &str) -> Result<Vec<u8>, String> {
         let fl_url = flurl::FlUrl::new(self.endpoint.as_str())
             .append_path_segment(bucket_name)
             .append_path_segment(key)
@@ -62,7 +57,7 @@ impl S3Client {
             "GET",
             bucket_name,
             Some(key),
-            content.as_slice(),
+            [].as_slice(),
         )?;
 
         let mut response = fl_url.get().await.map_err(|itm| itm.to_string())?;
@@ -84,12 +79,7 @@ impl S3Client {
         Err(err)
     }
 
-    pub async fn delete_file(
-        &self,
-        bucket_name: &str,
-        key: &str,
-        content: Vec<u8>,
-    ) -> Result<Vec<u8>, String> {
+    pub async fn delete_file(&self, bucket_name: &str, key: &str) -> Result<Vec<u8>, String> {
         let fl_url = flurl::FlUrl::new(self.endpoint.as_str())
             .append_path_segment(bucket_name)
             .append_path_segment(key)
@@ -101,7 +91,7 @@ impl S3Client {
             "DELETE",
             bucket_name,
             Some(key),
-            content.as_slice(),
+            [].as_slice(),
         )?;
 
         let mut response = fl_url.get().await.map_err(|itm| itm.to_string())?;
