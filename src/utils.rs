@@ -3,7 +3,7 @@ use hmac::{Hmac, Mac};
 use rust_extensions::date_time::DateTimeAsMicroseconds;
 use sha2::{Digest, Sha256};
 
-use crate::S3Client;
+use crate::{S3Client, S3Error};
 
 pub type HmacSha256 = Hmac<Sha256>;
 
@@ -14,7 +14,7 @@ pub fn populate_headers(
     bucket_name: &str,
     key: Option<&str>,
     content: &[u8],
-) -> Result<FlUrl, String> {
+) -> Result<FlUrl, S3Error> {
     let service = "s3";
     let payload_hash = format!("{:x}", sha2::Sha256::digest(content));
 

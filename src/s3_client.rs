@@ -1,3 +1,5 @@
+use super::S3Error;
+
 pub struct S3Client {
     pub access_key: String,
     pub secret_key: String,
@@ -11,7 +13,7 @@ impl S3Client {
         bucket_name: &str,
         key: &str,
         content: Vec<u8>,
-    ) -> Result<(), String> {
+    ) -> Result<(), S3Error> {
         let fl_url = flurl::FlUrl::new(self.endpoint.as_str())
             .append_path_segment(bucket_name)
             .append_path_segment(key)
@@ -39,13 +41,13 @@ impl S3Client {
         let err = format!(
             "Status Code: {}. Err: {}",
             status_code,
-            response.body_as_str().await.unwrap()
+            response.body_as_str().await?
         );
 
-        Err(err)
+        Err(err.into())
     }
 
-    pub async fn download_file(&self, bucket_name: &str, key: &str) -> Result<Vec<u8>, String> {
+    pub async fn download_file(&self, bucket_name: &str, key: &str) -> Result<Vec<u8>, S3Error> {
         let fl_url = flurl::FlUrl::new(self.endpoint.as_str())
             .append_path_segment(bucket_name)
             .append_path_segment(key)
@@ -60,26 +62,22 @@ impl S3Client {
             [].as_slice(),
         )?;
 
-        let mut response = fl_url.get().await.map_err(|itm| itm.to_string())?;
+        let mut response = fl_url.get().await?;
 
         let status_code = response.get_status_code();
         if status_code == 200 {
-            return Ok(response
-                .receive_body()
-                .await
-                .map_err(|itm| itm.to_string())?);
+            let body = response.receive_body().await?;
+            return Ok(body);
         }
 
-        let err = format!(
-            "Status Code: {}. Err: {}",
-            status_code,
-            response.body_as_str().await.unwrap()
-        );
+        let body = response.body_as_str().await?;
 
-        Err(err)
+        let err = format!("Status Code: {}. Err: {}", status_code, body);
+
+        Err(err.into())
     }
 
-    pub async fn delete_file(&self, bucket_name: &str, key: &str) -> Result<Vec<u8>, String> {
+    pub async fn delete_file(&self, bucket_name: &str, key: &str) -> Result<Vec<u8>, S3Error> {
         let fl_url = flurl::FlUrl::new(self.endpoint.as_str())
             .append_path_segment(bucket_name)
             .append_path_segment(key)
@@ -94,26 +92,21 @@ impl S3Client {
             [].as_slice(),
         )?;
 
-        let mut response = fl_url.get().await.map_err(|itm| itm.to_string())?;
+        let mut response = fl_url.get().await?;
 
         let status_code = response.get_status_code();
         if status_code == 200 {
-            return Ok(response
-                .receive_body()
-                .await
-                .map_err(|itm| itm.to_string())?);
+            let body = response.receive_body().await?;
+            return Ok(body);
         }
 
-        let err = format!(
-            "Status Code: {}. Err: {}",
-            status_code,
-            response.body_as_str().await.unwrap()
-        );
+        let err = response.body_as_str().await?;
+        let err = format!("Status Code: {}. Err: {}", status_code, err);
 
-        Err(err)
+        Err(err.into())
     }
 
-    pub async fn create_bucket(&self, bucket_name: &str) -> Result<(), String> {
+    pub async fn create_bucket(&self, bucket_name: &str) -> Result<(), S3Error> {
         let fl_url = flurl::FlUrl::new(self.endpoint.as_str())
             .append_path_segment(bucket_name)
             .with_retries(3);
@@ -121,19 +114,17 @@ impl S3Client {
         let fl_url =
             super::utils::populate_headers(self, fl_url, "PUT", bucket_name, None, [].as_slice())?;
 
-        let mut response = fl_url.put(None).await.map_err(|itm| itm.to_string())?;
+        let mut response = fl_url.put(None).await?;
 
         let status_code = response.get_status_code();
         if status_code == 200 {
             return Ok(());
         }
 
-        let err = format!(
-            "Status Code: {}. Err: {}",
-            status_code,
-            response.body_as_str().await.unwrap()
-        );
+        let body = response.body_as_str().await?;
 
-        Err(err)
+        let err = format!("Status Code: {}. Err: {}", status_code, body);
+
+        Err(err.into())
     }
 }
