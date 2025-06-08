@@ -3,7 +3,17 @@ use flurl::FlUrlError;
 #[derive(Debug)]
 pub enum S3Error {
     FlUrlError(FlUrlError),
+    BucketAlreadyExists,
     Other(String),
+}
+
+impl S3Error {
+    pub fn is_bucket_already_exists(&self) -> bool {
+        match self {
+            Self::BucketAlreadyExists => true,
+            _ => false,
+        }
+    }
 }
 
 impl From<FlUrlError> for S3Error {
