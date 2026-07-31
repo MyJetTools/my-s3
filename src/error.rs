@@ -4,15 +4,17 @@ use flurl::FlUrlError;
 pub enum S3Error {
     FlUrlError(FlUrlError),
     BucketAlreadyExists,
+    RangeNotSatisfiable,
     Other(String),
 }
 
 impl S3Error {
     pub fn is_bucket_already_exists(&self) -> bool {
-        match self {
-            Self::BucketAlreadyExists => true,
-            _ => false,
-        }
+        matches!(self, Self::BucketAlreadyExists)
+    }
+
+    pub fn is_range_not_satisfiable(&self) -> bool {
+        matches!(self, Self::RangeNotSatisfiable)
     }
 }
 

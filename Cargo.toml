@@ -10,9 +10,9 @@ rust-extensions = { tag = "0.1.5", git = "https://github.com/MyJetTools/rust-ext
 async-trait = "*"
 uuid = "*"
 
-hmac = "0.12"
-sha2 = "0.10"
+hmac = "0.13"
+sha2 = "0.11"
 hex = "0.4"
 
-flurl = { tag = "0.6.1", git = "https://github.com/MyJetTools/fl-url.git" }
+flurl = { tag = "0.7.0", git = "https://github.com/MyJetTools/fl-url.git" }
 my-xml-reader = { tag = "0.1.1", git = "https://github.com/MyJetTools/my-xml-reader" }
