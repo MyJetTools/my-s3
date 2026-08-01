@@ -7,12 +7,27 @@ edition = "2024"
 rust-extensions = { tag = "0.1.5", git = "https://github.com/MyJetTools/rust-extensions.git", features = [
     "with-tokio",
 ] }
-async-trait = "*"
-uuid = "*"
-
 hmac = "0.13"
 sha2 = "0.11"
 hex = "0.4"
 
 flurl = { tag = "0.7.0", git = "https://github.com/MyJetTools/fl-url.git" }
 my-xml-reader = { tag = "0.1.1", git = "https://github.com/MyJetTools/my-xml-reader" }
+
+# `RequestBodyStream` lives here and `flurl` does not re-export it (only `hyper`,
+# `my_tls` and `my_http_utils`). The tag MUST stay equal to the one `flurl` pins,
+# otherwise the graph ends up with two `hyper::body::Body` traits and
+# `put_request_streamed` stops accepting our body with a "trait not implemented" that
+# looks like a library bug.
+my-http-client = { tag = "0.1.2", git = "https://github.com/MyJetTools/my-http-client.git" }
+tokio = { version = "*", features = ["sync"] }
+
+[dev-dependencies]
+tokio = { version = "*", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "io-util",
+    "sync",
+    "time",
+] }
