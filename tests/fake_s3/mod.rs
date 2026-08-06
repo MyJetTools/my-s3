@@ -117,12 +117,12 @@ impl FakeS3 {
     /// server reads the region back out of the credential scope, the way a real one
     /// does before checking that scope against its own endpoint.
     pub fn client_in_region(&self, region: impl Into<my_s3::S3Region>) -> my_s3::S3Client {
-        my_s3::S3Client {
-            access_key: ACCESS_KEY.to_string(),
-            secret_key: SECRET_KEY.to_string(),
-            region: region.into(),
-            endpoint: self.endpoint.clone(),
-        }
+        my_s3::S3Client::new(
+            ACCESS_KEY,
+            SECRET_KEY,
+            region,
+            self.endpoint.as_str(),
+        )
     }
 }
 

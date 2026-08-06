@@ -12,6 +12,10 @@ use super::{S3Error, S3Region};
 /// be known at that point.
 const UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
 
+/// Marks every line of the console trace, so it can be told apart from - and grepped
+/// out of - whatever else the process writes to stdout.
+const DEBUG_PREFIX: &str = "[my-s3]";
+
 pub struct S3Client {
     pub access_key: String,
     pub secret_key: String,
@@ -20,9 +24,56 @@ pub struct S3Client {
     /// [`S3Region::from_str`] turns configuration into one.
     pub region: S3Region,
     pub endpoint: String,
+    /// Off unless [`Self::debug_to_console`] turned it on.
+    debug_to_console: bool,
 }
 
 impl S3Client {
+    pub fn new(
+        access_key: impl Into<String>,
+        secret_key: impl Into<String>,
+        region: impl Into<S3Region>,
+        endpoint: impl Into<String>,
+    ) -> Self {
+        Self {
+            access_key: access_key.into(),
+            secret_key: secret_key.into(),
+            region: region.into(),
+            endpoint: endpoint.into(),
+            debug_to_console: false,
+        }
+    }
+
+    /// Traces every request this client makes to stdout.
+    ///
+    /// The request is printed as it is about to go out - verb, url, and the size of the
+    /// body. The **answer** is printed in full only when it failed, because that body
+    /// is the `<Error><Code>` that says why; a successful one is printed as a size,
+    /// since it is the object that was just downloaded and nobody wants it on the
+    /// console.
+    ///
+    /// The same asymmetry applies to the request: a control body small enough to be the
+    /// point (the `CreateBucket` location constraint) is shown, an object payload is
+    /// shown as a size.
+    ///
+    /// `Authorization` is deliberately never printed - it carries the access key id and
+    /// the request's signature.
+    ///
+    /// ```no_run
+    /// # fn doc() -> my_s3::S3Client {
+    /// my_s3::S3Client::new(
+    ///     "access-key",
+    ///     "secret-key",
+    ///     "fsn1",
+    ///     "https://fsn1.your-objectstorage.com",
+    /// )
+    /// .debug_to_console()
+    /// # }
+    /// ```
+    pub fn debug_to_console(mut self) -> Self {
+        self.debug_to_console = true;
+        self
+    }
     /// Uploads an object that is already fully in memory.
     ///
     /// Peak memory is the size of `content` (plus whatever the caller holds), so this
@@ -52,11 +103,13 @@ impl S3Client {
 
         let fl_url = super::utils::sign_request(self, fl_url, "PUT", content.as_slice())?;
 
+        self.trace_request("PUT", &fl_url, DebugBody::Opaque(content.len()));
+
         let response = fl_url
             .put(flurl::body::HttpRequestBody::from_raw_data(content, None))
             .await?;
 
-        expect_success(response).await
+        self.expect_success(response).await
     }
 
     /// Uploads an object from a channel, so that peak memory is one chunk instead of
@@ -162,11 +215,13 @@ impl S3Client {
         let fl_url =
             super::utils::sign_request_with_payload_hash(self, fl_url, "PUT", UNSIGNED_PAYLOAD)?;
 
+        self.trace_request("PUT", &fl_url, DebugBody::Opaque(content_length));
+
         let response = fl_url
             .put_request_streamed(RequestBodyStream::from(body), Some(content_length))
             .await?;
 
-        expect_success(response).await
+        self.expect_success(response).await
     }
 
     /// [`Self::upload_streamed`] with the retry loop the streamed path cannot do on
@@ -302,6 +357,8 @@ impl S3Client {
             None => fl_url,
         };
 
+        self.trace_request("GET", &fl_url, DebugBody::None);
+
         let fl_url_response = fl_url.get().await?;
 
         let status_code = fl_url_response.get_status_code();
@@ -312,14 +369,20 @@ impl S3Client {
         // handing back far more data than asked for.
         let expected = if range.is_some() { 206 } else { 200 };
         if status_code == expected {
-            return Ok(fl_url_response.receive_body().await?);
+            let body = fl_url_response.receive_body().await?;
+            self.trace_response(status_code, Some(&body));
+            return Ok(body);
         }
 
         if range.is_some() && status_code == 416 {
+            self.trace_response(status_code, None);
             return Err(S3Error::RangeNotSatisfiable);
         }
 
         if range.is_some() && status_code == 200 {
+            // The body is deliberately left unread: it is the whole object, which is
+            // exactly what was not asked for.
+            self.trace_response(status_code, None);
             return Err(S3Error::Other(
                 "Server ignored the Range header and returned the full object (200 instead of 206)"
                     .to_string(),
@@ -327,6 +390,7 @@ impl S3Client {
         }
 
         let body = fl_url_response.receive_body().await?;
+        self.trace_response(status_code, Some(&body));
         Err(detect_error(status_code, &body))
     }
 
@@ -343,9 +407,11 @@ impl S3Client {
 
         let fl_url = super::utils::sign_request(self, fl_url, "DELETE", [].as_slice())?;
 
+        self.trace_request("DELETE", &fl_url, DebugBody::None);
+
         let fl_url_response = fl_url.delete().await?;
 
-        expect_success(fl_url_response).await
+        self.expect_success(fl_url_response).await
     }
 
     /// Creates a bucket in [`Self::region`] - the same region the request is signed
@@ -377,6 +443,16 @@ impl S3Client {
             configuration.as_deref().unwrap_or_default(),
         )?;
 
+        self.trace_request(
+            "PUT",
+            &fl_url,
+            match configuration.as_deref() {
+                // Small, and its content is the whole point of the call.
+                Some(configuration) => DebugBody::Text(configuration),
+                None => DebugBody::None,
+            },
+        );
+
         let body = match configuration {
             Some(configuration) => {
                 flurl::body::HttpRequestBody::from_raw_data(configuration, Some("application/xml"))
@@ -386,7 +462,7 @@ impl S3Client {
 
         let fl_url_response = fl_url.put(body).await?;
 
-        expect_success(fl_url_response).await
+        self.expect_success(fl_url_response).await
     }
 
     /// [`Self::create_bucket`], but a bucket that is **already ours** is success rather
@@ -403,6 +479,118 @@ impl S3Client {
             result => result,
         }
     }
+
+    async fn expect_success(&self, response: FlUrlResponse) -> Result<(), S3Error> {
+        self.read_success_body(response).await?;
+        Ok(())
+    }
+
+    async fn read_success_body(&self, response: FlUrlResponse) -> Result<Vec<u8>, S3Error> {
+        let status_code = response.get_status_code();
+
+        // Read the body either way: on success it is the payload, on failure it carries
+        // `<Error><Code>`, which is the only reliable way to tell the failures apart.
+        let body = response.receive_body().await?;
+
+        self.trace_response(status_code, Some(&body));
+
+        if is_success(status_code) {
+            return Ok(body);
+        }
+
+        Err(detect_error(status_code, &body))
+    }
+
+    /// Prints the request that is about to go out, when [`Self::debug_to_console`] is
+    /// on. Called **after** signing, so what it reports is what the socket will carry.
+    fn trace_request(&self, method: &str, fl_url: &flurl::FlUrl, body: DebugBody<'_>) {
+        if !self.debug_to_console {
+            return;
+        }
+
+        // Read back out of the url builder rather than rebuilt from `endpoint` and the
+        // segments: the builder percent-encodes as it goes, and a trace that shows
+        // something other than what was sent is worse than no trace at all.
+        let url = format!(
+            "{}{}",
+            fl_url.url_builder.get_scheme_and_host(),
+            fl_url.url_builder.get_path_and_query()
+        );
+
+        println!("{}", format_request_trace(method, url.as_str(), body));
+    }
+
+    /// Prints the answer, when [`Self::debug_to_console`] is on.
+    ///
+    /// `body` is `None` when the outcome was decided without reading it - a `416`, or a
+    /// server that ignored `Range` and is about to send a whole object nobody asked
+    /// for. Printing a zero length there would be a lie.
+    fn trace_response(&self, status_code: u16, body: Option<&[u8]>) {
+        if !self.debug_to_console {
+            return;
+        }
+
+        println!("{}", format_response_trace(status_code, body));
+    }
+}
+
+/// What the trace says about the body of a request.
+enum DebugBody<'s> {
+    /// No body at all.
+    None,
+    /// A control body small enough that its content *is* what is being debugged - the
+    /// `CreateBucket` location constraint.
+    Text(&'s [u8]),
+    /// An object payload: only its size is traced. It is opaque and can be arbitrarily
+    /// large, so printing it would flood the console and say nothing.
+    Opaque(usize),
+}
+
+fn format_request_trace(method: &str, url: &str, body: DebugBody<'_>) -> String {
+    let mut result = format!("{} --> {} {}", DEBUG_PREFIX, method, url);
+
+    match body {
+        DebugBody::None => {}
+        DebugBody::Text(body) => result.push_str(
+            format!(
+                "\n{}     body {} bytes: {}",
+                DEBUG_PREFIX,
+                body.len(),
+                String::from_utf8_lossy(body)
+            )
+            .as_str(),
+        ),
+        DebugBody::Opaque(len) => {
+            result.push_str(format!("\n{}     body {} bytes", DEBUG_PREFIX, len).as_str())
+        }
+    }
+
+    result
+}
+
+/// A failure is printed in full: that body is the `<Error><Code>` saying why, and it is
+/// small. A success is printed as a size - it is the object that was just downloaded.
+fn format_response_trace(status_code: u16, body: Option<&[u8]>) -> String {
+    let Some(body) = body else {
+        return format!("{} <-- {}, body not read", DEBUG_PREFIX, status_code);
+    };
+
+    if is_success(status_code) {
+        return format!(
+            "{} <-- {}, body {} bytes",
+            DEBUG_PREFIX,
+            status_code,
+            body.len()
+        );
+    }
+
+    format!(
+        "{} <-- {}, body {} bytes: {}",
+        DEBUG_PREFIX,
+        status_code,
+        body.len(),
+        String::from_utf8_lossy(body)
+    )
 }
 
 /// The `CreateBucket` body that places the bucket, or `None` when the region is stated
@@ -446,25 +634,6 @@ fn create_bucket_configuration(region: &S3Region) -> Option<Vec<u8>> {
 /// hard delete silently removed nothing.
 fn is_success(status_code: u16) -> bool {
     (200..300).contains(&status_code)
-}
-
-async fn expect_success(response: FlUrlResponse) -> Result<(), S3Error> {
-    read_success_body(response).await?;
-    Ok(())
-}
-
-async fn read_success_body(response: FlUrlResponse) -> Result<Vec<u8>, S3Error> {
-    let status_code = response.get_status_code();
-
-    // Read the body either way: on success it is the payload, on failure it carries
-    // `<Error><Code>`, which is the only reliable way to tell the failures apart.
-    let body = response.receive_body().await?;
-
-    if is_success(status_code) {
-        return Ok(body);
-    }
-
-    Err(detect_error(status_code, &body))
 }
 
 /// Maps a non-2xx answer onto a typed error.
