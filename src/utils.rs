@@ -54,13 +54,13 @@ pub fn sign_request_with_payload_hash(
     );
     let hashed_canonical_request = hex::encode(Sha256::digest(canonical_request.as_bytes()));
 
-    let scope = format!("{}/{}/{}/aws4_request", date, s3.region, service);
+    let scope = format!("{}/{}/{}/aws4_request", date, s3.region.as_str(), service);
     let string_to_sign = format!(
         "AWS4-HMAC-SHA256\n{}\n{}\n{}",
         timestamp, scope, hashed_canonical_request
     );
 
-    let signing_key = get_signature_key(&s3.secret_key, &date, &s3.region, service);
+    let signing_key = get_signature_key(&s3.secret_key, &date, s3.region.as_str(), service);
 
     let mut mac = HmacSha256::new_from_slice(&signing_key).map_err(|itm| itm.to_string())?;
     mac.update(string_to_sign.as_bytes());

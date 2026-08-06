@@ -4,7 +4,7 @@ use flurl::FlUrlResponse;
 use my_http_client::RequestBodyStream;
 use tokio::sync::mpsc::Receiver;
 
-use super::S3Error;
+use super::{S3Error, S3Region};
 
 /// `x-amz-content-sha256` value that tells S3 the payload is not covered by the
 /// signature. Required for a streamed body: the header has to be signed before the
@@ -15,7 +15,10 @@ const UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
 pub struct S3Client {
     pub access_key: String,
     pub secret_key: String,
-    pub region: String,
+    /// Signed into the credential scope of every request, and stated again in the
+    /// `LocationConstraint` of [`Self::create_bucket`]. `"eu-west-1".into()` or
+    /// [`S3Region::from_str`] turns configuration into one.
+    pub region: S3Region,
     pub endpoint: String,
 }
 
@@ -345,22 +348,95 @@ impl S3Client {
         expect_success(fl_url_response).await
     }
 
-    /// Creates a bucket.
+    /// Creates a bucket in [`Self::region`] - the same region the request is signed
+    /// for.
     ///
-    /// Re-creating a bucket we already own is [`S3Error::BucketAlreadyOwnedByYou`],
-    /// which is what happens on every restart of a service that ensures its bucket at
-    /// startup - see [`S3Error::bucket_name_is_taken`] for treating that as success.
+    /// The bucket is placed by the `LocationConstraint` in the body, which S3 requires
+    /// to agree with the region of the endpoint the request went to. `us-east-1` is the
+    /// one region stated by *not* sending the element - AWS rejects naming it
+    /// explicitly, and an absent body already means exactly it.
+    ///
+    /// Re-creating a bucket we already own is [`S3Error::BucketAlreadyOwnedByYou`] -
+    /// see [`Self::create_bucket_if_not_exists`] for treating that as success, or
+    /// [`S3Error::bucket_name_is_taken`] to decide it at the call site.
     pub async fn create_bucket(&self, bucket_name: &str) -> Result<(), S3Error> {
         let fl_url = flurl::FlUrl::new(self.endpoint.as_str())
             .append_path_segment(bucket_name)
             .with_retries(3);
 
-        let fl_url = super::utils::sign_request(self, fl_url, "PUT", [].as_slice())?;
+        let configuration = create_bucket_configuration(&self.region);
 
-        let fl_url_response = fl_url.put(flurl::body::HttpRequestBody::empty()).await?;
+        // The payload hash is part of the signature, so what is signed here has to be
+        // the very bytes `put` sends below. Signing an empty payload and then sending
+        // the XML answers 403 SignatureDoesNotMatch, which reads as a credentials
+        // problem rather than as the mismatch it is.
+        let fl_url = super::utils::sign_request(
+            self,
+            fl_url,
+            "PUT",
+            configuration.as_deref().unwrap_or_default(),
+        )?;
+
+        let body = match configuration {
+            Some(configuration) => {
+                flurl::body::HttpRequestBody::from_raw_data(configuration, Some("application/xml"))
+            }
+            None => flurl::body::HttpRequestBody::empty(),
+        };
+
+        let fl_url_response = fl_url.put(body).await?;
 
         expect_success(fl_url_response).await
     }
+
+    /// [`Self::create_bucket`], but a bucket that is **already ours** is success rather
+    /// than an error - for the ensure-the-bucket-is-there call that runs before every
+    /// use of it, where the second run must not fail differently from the first.
+    ///
+    /// Only [`S3Error::BucketAlreadyOwnedByYou`] is absorbed.
+    /// [`S3Error::BucketAlreadyExists`] - the name is held by *another account* - stays
+    /// an error, because the bucket that exists is then not the one the caller is about
+    /// to write to.
+    pub async fn create_bucket_if_not_exists(&self, bucket_name: &str) -> Result<(), S3Error> {
+        match self.create_bucket(bucket_name).await {
+            Err(err) if err.is_bucket_already_owned_by_you() => Ok(()),
+            result => result,
+        }
+    }
+}
+
+/// The `CreateBucket` body that places the bucket, or `None` when the region is stated
+/// by sending no body at all.
+///
+/// `CreateBucket` names its region **twice** - the endpoint the request is sent to, and
+/// this element - and S3 requires the two to agree. An absent body is not "the region
+/// does not matter", it is literally `us-east-1`, S3's historical default; sending none
+/// to any other regional endpoint is a contradiction, and AWS refuses to guess:
+///
+/// ```text
+/// 400 IllegalLocationConstraintException
+/// The unspecified location constraint is incompatible for the region specific
+/// endpoint this request was sent to.
+/// ```
+///
+/// `us-east-1` is therefore the one region that must **not** be named: AWS rejects an
+/// explicit `LocationConstraint` of `us-east-1`, so it keeps the empty body. An empty
+/// region is the same statement - `<LocationConstraint></LocationConstraint>` would
+/// only be a malformed way of saying the default.
+fn create_bucket_configuration(region: &S3Region) -> Option<Vec<u8>> {
+    if region.is_empty() || region.is_us_east_1() {
+        return None;
+    }
+
+    // The xmlns is what every AWS SDK sends and what the AWS docs show. Nothing rejects
+    // the element without it, but nothing rejects it with it either, so it is the safer
+    // of the two against S3-compatible implementations.
+    let configuration = format!(
+        "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LocationConstraint>{}</LocationConstraint></CreateBucketConfiguration>",
+        region.as_str()
+    );
+
+    Some(configuration.into_bytes())
 }
 
 /// Any 2xx is a success.
@@ -447,6 +523,54 @@ mod tests {
         assert!(is_success(206));
         assert!(!is_success(404));
         assert!(!is_success(300));
+    }
+
+    /// Anything but `us-east-1` has to say where the bucket goes, or the regional
+    /// endpoint answers 400 IllegalLocationConstraintException.
+    #[test]
+    fn a_regional_bucket_states_where_it_goes() {
+        let configuration = create_bucket_configuration(&S3Region::AwsEuWest1).unwrap();
+
+        assert_eq!(
+            String::from_utf8(configuration).unwrap(),
+            "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LocationConstraint>eu-west-1</LocationConstraint></CreateBucketConfiguration>"
+        );
+    }
+
+    /// The inverse rule, and the reason this cannot simply always send the element:
+    /// AWS rejects an explicit `LocationConstraint` of `us-east-1`. The empty body *is*
+    /// how that region is stated.
+    #[test]
+    fn us_east_1_is_stated_by_sending_nothing() {
+        assert!(create_bucket_configuration(&S3Region::AwsUsEast1).is_none());
+        // However the region was built - the rule follows the string, not the variant.
+        assert!(create_bucket_configuration(&S3Region::from_str("us-east-1")).is_none());
+        // A region that was never configured means the default, not an empty element.
+        assert!(create_bucket_configuration(&S3Region::from_str("")).is_none());
+    }
+
+    /// Non-AWS endpoints name their regions freely, and the value has to reach the body
+    /// verbatim - it is the same string the signature's credential scope is built from.
+    /// Hetzner documents creating a bucket with `--region fsn1`, so `fsn1` is what its
+    /// `LocationConstraint` has to say.
+    #[test]
+    fn a_non_aws_region_is_passed_through_verbatim() {
+        for region in [
+            S3Region::HetznerFsn1,
+            S3Region::Other("some-private-ceph".to_string()),
+        ] {
+            let configuration = create_bucket_configuration(&region).unwrap();
+
+            assert!(
+                String::from_utf8(configuration).unwrap().contains(
+                    format!(
+                        "<LocationConstraint>{}</LocationConstraint>",
+                        region.as_str()
+                    )
+                    .as_str()
+                )
+            );
+        }
     }
 
     #[test]

@@ -10,6 +10,7 @@ mod fake_s3;
 use std::time::Duration;
 
 use fake_s3::FakeS3;
+use sha2::Digest;
 
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -426,6 +427,196 @@ async fn create_bucket_succeeds_on_200() {
     client.create_bucket("my-bucket").await.unwrap();
 
     assert_eq!(server.captured()[0].method, "PUT");
+}
+
+// ---------------------------------------------------------------------------
+// CreateBucket: the location constraint
+// ---------------------------------------------------------------------------
+
+fn location_constraint_xml(region: &str) -> String {
+    format!(
+        "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LocationConstraint>{}</LocationConstraint></CreateBucketConfiguration>",
+        region
+    )
+}
+
+/// `CreateBucket` names its region twice - the endpoint and the body - and S3 requires
+/// the two to agree. An empty body is not "any region", it is literally `us-east-1`, so
+/// against every other regional endpoint it used to answer
+/// `400 IllegalLocationConstraintException` and no bucket was ever created outside
+/// `us-east-1`.
+#[tokio::test]
+async fn create_bucket_outside_us_east_1_states_the_location() {
+    let server = FakeS3::start().await;
+    let client = server.client_in_region("eu-west-1");
+
+    client.create_bucket("my-bucket").await.unwrap();
+
+    let captured = server.captured();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].method, "PUT");
+    assert_eq!(captured[0].target, "/my-bucket");
+    assert_eq!(
+        String::from_utf8_lossy(&captured[0].body),
+        location_constraint_xml("eu-west-1")
+    );
+}
+
+/// The body is covered by the signature, so the bytes handed to the signer have to be
+/// the bytes that go out. Signing an empty payload and then sending the XML turns the
+/// 400 into a 403 SignatureDoesNotMatch - a different bug wearing the same shirt.
+#[tokio::test]
+async fn the_location_constraint_is_covered_by_the_signature() {
+    let server = FakeS3::start().await;
+    let client = server.client_in_region("eu-central-1");
+
+    client.create_bucket("my-bucket").await.unwrap();
+
+    let captured = server.captured();
+
+    // `signature_valid` already refuses a payload hash that does not match the body;
+    // this pins the header itself, so a regression cannot hide behind the verifier.
+    assert_eq!(
+        captured[0].header("x-amz-content-sha256"),
+        Some(hex::encode(sha2::Sha256::digest(&captured[0].body)).as_str())
+    );
+    assert!(
+        captured[0].signature_valid,
+        "the signature must cover the body as sent: {:?}",
+        captured[0]
+    );
+}
+
+/// The one region that must **not** be named: AWS rejects an explicit
+/// `LocationConstraint` of `us-east-1`, so there the empty body is the correct request
+/// and the payload hash stays the canonical hash of nothing.
+#[tokio::test]
+async fn create_bucket_in_us_east_1_sends_no_body() {
+    const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    let server = FakeS3::start().await;
+    let client = server.client_in_region("us-east-1");
+
+    client.create_bucket("my-bucket").await.unwrap();
+
+    let captured = server.captured();
+    assert!(
+        captured[0].body.is_empty(),
+        "AWS rejects an explicit us-east-1 LocationConstraint, got {:?}",
+        String::from_utf8_lossy(&captured[0].body)
+    );
+    assert_eq!(
+        captured[0].header("x-amz-content-sha256"),
+        Some(EMPTY_SHA256)
+    );
+    assert!(captured[0].signature_valid);
+}
+
+/// Only `create_bucket` carries a body: adding one to a verb that never had one would
+/// break every other call's signature, and this is the assertion that would catch it.
+#[tokio::test]
+async fn no_other_request_grew_a_body() {
+    let server = FakeS3::start().await;
+    let client = server.client_in_region("eu-west-1");
+
+    server.push_reply(200, "contents");
+    client.download_file("my-bucket", "a.bin").await.unwrap();
+
+    server.push_reply(204, "");
+    client.delete_file("my-bucket", "a.bin").await.unwrap();
+
+    for captured in server.captured() {
+        assert!(
+            captured.body.is_empty(),
+            "{} must not carry a body: {:?}",
+            captured.method,
+            captured
+        );
+        assert!(captured.signature_valid);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CreateBucket: creating one that is already there
+// ---------------------------------------------------------------------------
+
+/// Creating the bucket before using it is the normal way to ensure it exists, so the
+/// call has to survive being made again against a bucket that is already ours - S3
+/// answers that with 409 `BucketAlreadyOwnedByYou`.
+#[tokio::test]
+async fn creating_a_bucket_that_is_already_ours_is_tolerated() {
+    let server = FakeS3::start().await;
+    let client = server.client_in_region("eu-west-1");
+
+    // First call: the bucket gets created.
+    client
+        .create_bucket_if_not_exists("my-bucket")
+        .await
+        .unwrap();
+
+    // Every call after that: S3 says it is already there and it is ours.
+    server.push_reply(
+        409,
+        "<Error><Code>BucketAlreadyOwnedByYou</Code><Message>you own it</Message></Error>",
+    );
+
+    client
+        .create_bucket_if_not_exists("my-bucket")
+        .await
+        .unwrap();
+
+    let captured = server.captured();
+    assert_eq!(captured.len(), 2);
+
+    // The repeat is the same well-formed, correctly signed request as the first one -
+    // it is answered differently, not sent differently.
+    for attempt in &captured {
+        assert_eq!(
+            String::from_utf8_lossy(&attempt.body),
+            location_constraint_xml("eu-west-1")
+        );
+        assert!(attempt.signature_valid);
+    }
+}
+
+/// The tolerance stops exactly where the bucket stops being ours: a name held by
+/// another account means the bucket that exists is not the one about to be written to.
+#[tokio::test]
+async fn a_bucket_owned_by_somebody_else_is_not_tolerated() {
+    let server = FakeS3::start().await;
+    let client = server.client_in_region("eu-west-1");
+
+    server.push_reply(
+        409,
+        "<Error><Code>BucketAlreadyExists</Code><Message>taken</Message></Error>",
+    );
+
+    let err = client
+        .create_bucket_if_not_exists("my-bucket")
+        .await
+        .unwrap_err();
+
+    assert!(err.is_bucket_already_exists());
+    assert!(!err.is_bucket_already_owned_by_you());
+}
+
+/// A real failure is not swallowed either - only the "already ours" answer is.
+#[tokio::test]
+async fn create_bucket_if_not_exists_still_reports_a_real_failure() {
+    let server = FakeS3::start().await;
+    let client = server.client_in_region("eu-west-1");
+
+    server.push_reply(
+        403,
+        "<Error><Code>AccessDenied</Code><Message>no</Message></Error>",
+    );
+
+    let err = client
+        .create_bucket_if_not_exists("my-bucket")
+        .await
+        .unwrap_err();
+
+    assert_eq!(err.get_status_code(), Some(403));
 }
 
 // ---------------------------------------------------------------------------

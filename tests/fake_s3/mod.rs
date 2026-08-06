@@ -18,7 +18,10 @@ type HmacSha256 = Hmac<Sha256>;
 
 pub const ACCESS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
 pub const SECRET_KEY: &str = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
-pub const REGION: &str = "fsn1";
+
+/// What most tests run as. A non-AWS region on purpose: nothing in this crate may
+/// assume the AWS naming, and it is the shape the signature is checked against.
+pub const REGION: my_s3::S3Region = my_s3::S3Region::HetznerFsn1;
 
 /// Everything one request looked like once it arrived.
 #[derive(Debug, Clone)]
@@ -107,10 +110,17 @@ impl FakeS3 {
     }
 
     pub fn client(&self) -> my_s3::S3Client {
+        self.client_in_region(REGION)
+    }
+
+    /// A client configured for another region. The signature is still verified: the
+    /// server reads the region back out of the credential scope, the way a real one
+    /// does before checking that scope against its own endpoint.
+    pub fn client_in_region(&self, region: impl Into<my_s3::S3Region>) -> my_s3::S3Client {
         my_s3::S3Client {
             access_key: ACCESS_KEY.to_string(),
             secret_key: SECRET_KEY.to_string(),
-            region: REGION.to_string(),
+            region: region.into(),
             endpoint: self.endpoint.clone(),
         }
     }
@@ -329,6 +339,19 @@ fn verify_signature(method: &str, target: &str, headers: &[(String, String)], bo
     };
     let expected_signature = signature_part.trim();
 
+    // `Credential=<key>/<date>/<region>/s3/aws4_request`. The region is taken from the
+    // scope rather than assumed to be `REGION`, so a client configured for any region
+    // can be driven through this server; a real S3 reads it the same way and then
+    // checks it against the region of the endpoint that was addressed.
+    let Some(scope_region) = authorization
+        .split("Credential=")
+        .nth(1)
+        .and_then(|credential| credential.split(',').next())
+        .and_then(|credential| credential.split('/').nth(2))
+    else {
+        return false;
+    };
+
     let (path, query) = match target.split_once('?') {
         Some((path, query)) => (path, Some(query)),
         None => (target, None),
@@ -357,7 +380,7 @@ fn verify_signature(method: &str, target: &str, headers: &[(String, String)], bo
     );
 
     let date = &timestamp[..8];
-    let scope = format!("{}/{}/s3/aws4_request", date, REGION);
+    let scope = format!("{}/{}/s3/aws4_request", date, scope_region);
     let string_to_sign = format!(
         "AWS4-HMAC-SHA256\n{}\n{}\n{}",
         timestamp,
@@ -365,7 +388,7 @@ fn verify_signature(method: &str, target: &str, headers: &[(String, String)], bo
         hex::encode(Sha256::digest(canonical_request.as_bytes()))
     );
 
-    let signing_key = derive_signing_key(SECRET_KEY, date, REGION, "s3");
+    let signing_key = derive_signing_key(SECRET_KEY, date, scope_region, "s3");
     let mut mac = HmacSha256::new_from_slice(&signing_key).unwrap();
     mac.update(string_to_sign.as_bytes());
 
