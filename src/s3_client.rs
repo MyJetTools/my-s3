@@ -16,6 +16,10 @@ const UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
 /// out of - whatever else the process writes to stdout.
 const DEBUG_PREFIX: &str = "[my-s3]";
 
+/// `FlUrl::append_query_param` takes `Option<impl Into<StrOrString>>`, so a bare `None`
+/// leaves the value type unresolved. This names it once instead of at every call site.
+const NO_VALUE: Option<&str> = None;
+
 pub struct S3Client {
     pub access_key: String,
     pub secret_key: String,
@@ -450,6 +454,72 @@ impl S3Client {
         self.expect_success(fl_url_response).await
     }
 
+    /// Asks the storage which region a bucket is actually in - `GET /{bucket}?location`.
+    ///
+    /// This answers the question [`Self::create_bucket`] gets wrong loudly: the region
+    /// is stated both by the endpoint and by the `LocationConstraint`, and when the two
+    /// disagree the answer is a `400`, not a bucket. This is how to see what the storage
+    /// thinks, rather than what the configuration says.
+    ///
+    /// `us-east-1` comes back as an **empty** constraint - AWS states the default region
+    /// by omitting it, the same asymmetry `CreateBucket` has - and is reported here as
+    /// [`S3Region::AwsUsEast1`] rather than as an empty region.
+    ///
+    /// A region this crate does not have a variant for comes back as
+    /// [`S3Region::Other`], carried verbatim.
+    pub async fn get_bucket_location(&self, bucket_name: &str) -> Result<S3Region, S3Error> {
+        let fl_url = flurl::FlUrl::new(self.endpoint.as_str())
+            .append_path_segment(bucket_name)
+            .append_query_param("location", NO_VALUE)
+            .with_retries(3);
+
+        // `?location` is a valueless flag, and it is part of the canonical request:
+        // SigV4 canonicalises it to `location=`, which is also how the server reads it
+        // off the wire. Signing has to happen after it is appended.
+        let fl_url = super::utils::sign_request(self, fl_url, "GET", [].as_slice())?;
+
+        let response = self.send_get(fl_url).await?;
+
+        let body = self.read_success_body(response).await?;
+
+        parse_bucket_location(&body)
+    }
+
+    /// Whether the bucket is there and reachable with these credentials -
+    /// `HEAD /{bucket}`.
+    ///
+    /// A `404` is `Ok(false)`: "not there" is an answer, not a failure. A `403` stays an
+    /// error, because it means either that the name belongs to another account or that
+    /// these credentials are wrong, and collapsing both into "it exists" would report a
+    /// bad key as a healthy bucket.
+    ///
+    /// The answer to a `HEAD` carries **no body**, so a failure here has no
+    /// `<Error><Code>` to be typed from - the status code is all there is.
+    pub async fn check_if_bucket_exists(&self, bucket_name: &str) -> Result<bool, S3Error> {
+        let fl_url = flurl::FlUrl::new(self.endpoint.as_str())
+            .append_path_segment(bucket_name)
+            .with_retries(3);
+
+        let fl_url = super::utils::sign_request(self, fl_url, "HEAD", [].as_slice())?;
+
+        let response = self.send_head(fl_url).await?;
+
+        let status_code = response.get_status_code();
+
+        // Nothing to read: a HEAD answer has no body by definition.
+        self.trace_response(status_code, None);
+
+        if is_success(status_code) {
+            return Ok(true);
+        }
+
+        if status_code == 404 {
+            return Ok(false);
+        }
+
+        Err(detect_error(status_code, &[]))
+    }
+
     /// [`Self::create_bucket`], but a bucket that is **already ours** is success rather
     /// than an error - for the ensure-the-bucket-is-there call that runs before every
     /// use of it, where the second run must not fail differently from the first.
@@ -499,6 +569,18 @@ impl S3Client {
 
         let mut request = String::new();
         let response = fl_url.get_with_debug(&mut request).await;
+        println!("{} --> {}", DEBUG_PREFIX, request);
+
+        Ok(response?)
+    }
+
+    async fn send_head(&self, fl_url: flurl::FlUrl) -> Result<FlUrlResponse, S3Error> {
+        if !self.debug_to_console {
+            return Ok(fl_url.head().await?);
+        }
+
+        let mut request = String::new();
+        let response = fl_url.head_with_debug(&mut request).await;
         println!("{} --> {}", DEBUG_PREFIX, request);
 
         Ok(response?)
@@ -646,6 +728,36 @@ fn is_success(status_code: u16) -> bool {
     (200..300).contains(&status_code)
 }
 
+/// Reads the region out of a `GetBucketLocation` answer.
+///
+/// The document is a bare `<LocationConstraint>` at the root, and `us-east-1` is stated
+/// by leaving it **empty** - the same "the default region is the absent one" rule that
+/// [`create_bucket_configuration`] obeys from the other side.
+///
+/// Empty comes in two spellings, and only one of them survives the reader:
+/// `<LocationConstraint></LocationConstraint>` reads as `Some("")`, while AWS's actual
+/// `<LocationConstraint/>` has no text node at all and reads as `None` - which is also
+/// what a proxy's HTML error page reads as. Telling those two apart takes looking for
+/// the element itself, and the difference matters: one is an answer, the other must not
+/// be reported as a region.
+fn parse_bucket_location(body: &[u8]) -> Result<S3Region, S3Error> {
+    match crate::xml::read_node_text(body, "LocationConstraint") {
+        Some(region) if region.is_empty() => Ok(S3Region::AwsUsEast1),
+        Some(region) => Ok(S3Region::from_str(region.as_str())),
+        None if contains(body, b"<LocationConstraint") => Ok(S3Region::AwsUsEast1),
+        None => Err(S3Error::Other(format!(
+            "GetBucketLocation answered with a body that is not a LocationConstraint: {}",
+            String::from_utf8_lossy(body)
+        ))),
+    }
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
 /// Maps a non-2xx answer onto a typed error.
 ///
 /// Prefers the `<Error><Code>` in the body over the status code, because the status
@@ -748,6 +860,66 @@ mod tests {
                     )
                     .as_str()
                 )
+            );
+        }
+    }
+
+    /// The ordinary answer.
+    #[test]
+    fn a_regional_bucket_reports_its_region() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?><LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/">eu-west-1</LocationConstraint>"#;
+
+        assert_eq!(
+            parse_bucket_location(xml.as_bytes()).unwrap(),
+            S3Region::AwsEuWest1
+        );
+    }
+
+    /// A region outside the catalogue has to survive the round trip - the answer is the
+    /// storage's, not ours to validate.
+    #[test]
+    fn an_unknown_region_survives_the_round_trip() {
+        let xml = "<LocationConstraint>some-private-ceph</LocationConstraint>";
+
+        assert_eq!(
+            parse_bucket_location(xml.as_bytes()).unwrap(),
+            S3Region::Other("some-private-ceph".to_string())
+        );
+    }
+
+    /// Both spellings of "empty" mean `us-east-1`, and only one of them has a text node
+    /// for the reader to find - AWS sends the self-closing one.
+    #[test]
+    fn an_empty_constraint_is_us_east_1_in_either_spelling() {
+        for xml in [
+            r#"<?xml version="1.0" encoding="UTF-8"?><LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/"/>"#,
+            r#"<?xml version="1.0" encoding="UTF-8"?><LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/"></LocationConstraint>"#,
+            "<LocationConstraint/>",
+        ] {
+            assert_eq!(
+                parse_bucket_location(xml.as_bytes()).unwrap(),
+                S3Region::AwsUsEast1,
+                "got it wrong for {}",
+                xml
+            );
+        }
+    }
+
+    /// The reason the self-closing case cannot simply be "no text means us-east-1": a
+    /// proxy's error page reads exactly the same way, and reporting it as a region
+    /// would be inventing an answer.
+    #[test]
+    fn a_body_that_is_not_a_location_is_an_error_not_a_default() {
+        for body in [
+            b"502 Bad Gateway".as_slice(),
+            b"".as_slice(),
+            b"<html>nope</html>".as_slice(),
+            b"<Error><Code>AccessDenied</Code></Error>".as_slice(),
+        ] {
+            assert!(
+                parse_bucket_location(body).is_err(),
+                "{:?} must not read as a region",
+                String::from_utf8_lossy(body)
             );
         }
     }

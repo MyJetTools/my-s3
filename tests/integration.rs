@@ -537,6 +537,159 @@ async fn no_other_request_grew_a_body() {
 }
 
 // ---------------------------------------------------------------------------
+// GetBucketLocation
+// ---------------------------------------------------------------------------
+
+fn location_answer(region: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><LocationConstraint xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">{}</LocationConstraint>",
+        region
+    )
+}
+
+/// `?location` is a valueless flag and it is part of the canonical request, so it has
+/// to be appended *before* signing - SigV4 canonicalises it to `location=`. Getting
+/// that wrong is a 403 that looks like bad credentials.
+#[tokio::test]
+async fn get_bucket_location_asks_for_the_location_subresource() {
+    let server = FakeS3::start().await;
+    let client = server.client_in_region("eu-west-1");
+
+    server.push_reply(200, location_answer("eu-west-1").as_str());
+
+    let region = client.get_bucket_location("my-bucket").await.unwrap();
+
+    assert_eq!(region, my_s3::S3Region::AwsEuWest1);
+
+    let captured = server.captured();
+    assert_eq!(captured[0].method, "GET");
+    assert_eq!(captured[0].target, "/my-bucket?location");
+    assert!(
+        captured[0].signature_valid,
+        "the query param must be covered by the signature: {:?}",
+        captured[0]
+    );
+}
+
+/// The answer is the storage's own, and it does not have to agree with what this client
+/// was configured for - that disagreement is the whole reason to ask.
+#[tokio::test]
+async fn get_bucket_location_reports_a_region_other_than_the_configured_one() {
+    let server = FakeS3::start().await;
+    let client = server.client_in_region("eu-west-1");
+
+    server.push_reply(200, location_answer("fsn1").as_str());
+
+    assert_eq!(
+        client.get_bucket_location("my-bucket").await.unwrap(),
+        my_s3::S3Region::HetznerFsn1
+    );
+}
+
+/// AWS states `us-east-1` by sending an empty constraint - the same asymmetry
+/// `CreateBucket` has from the other side.
+#[tokio::test]
+async fn get_bucket_location_reads_an_empty_constraint_as_us_east_1() {
+    let server = FakeS3::start().await;
+    let client = server.client_in_region("us-east-1");
+
+    server.push_reply(
+        200,
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><LocationConstraint xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"/>",
+    );
+
+    assert_eq!(
+        client.get_bucket_location("my-bucket").await.unwrap(),
+        my_s3::S3Region::AwsUsEast1
+    );
+}
+
+#[tokio::test]
+async fn get_bucket_location_on_a_missing_bucket_is_typed() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    server.push_reply(
+        404,
+        "<Error><Code>NoSuchBucket</Code><Message>The specified bucket does not exist.</Message></Error>",
+    );
+
+    let err = client.get_bucket_location("my-bucket").await.unwrap_err();
+
+    assert!(err.is_bucket_not_found());
+}
+
+// ---------------------------------------------------------------------------
+// CheckIfBucketExists
+// ---------------------------------------------------------------------------
+
+/// A HEAD carries no body, in the request or in the answer, so the status code is the
+/// entire result.
+#[tokio::test]
+async fn a_bucket_that_is_there_is_reported_as_existing() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    assert!(client.check_if_bucket_exists("my-bucket").await.unwrap());
+
+    let captured = server.captured();
+    assert_eq!(captured[0].method, "HEAD");
+    assert_eq!(captured[0].target, "/my-bucket");
+    assert!(captured[0].body.is_empty());
+    assert!(captured[0].signature_valid);
+}
+
+/// "Not there" is an answer, not a failure: `Ok(false)`, so the caller does not have to
+/// pattern-match an error to learn something ordinary.
+#[tokio::test]
+async fn a_missing_bucket_is_reported_as_absent_not_as_an_error() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    server.push_reply(404, "");
+
+    assert!(!client.check_if_bucket_exists("my-bucket").await.unwrap());
+}
+
+/// A 403 must not collapse into "it exists": it means the name belongs to another
+/// account *or* that these credentials are wrong, and the second one has to be visible.
+#[tokio::test]
+async fn a_forbidden_bucket_stays_an_error() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    server.push_reply(403, "");
+
+    let err = client
+        .check_if_bucket_exists("my-bucket")
+        .await
+        .unwrap_err();
+
+    assert_eq!(err.get_status_code(), Some(403));
+    assert!(!err.is_retryable());
+}
+
+/// A HEAD followed by an ordinary request on the same client, end to end - the sequence
+/// a caller makes when it checks for the bucket and then uses it.
+///
+/// Note this does not prove anything about connection pooling: the client survives a
+/// server that wrongly writes a body after HEAD headers too, so the assertion here is
+/// only that both calls complete and both are seen.
+#[tokio::test]
+async fn a_head_is_followed_by_a_working_request() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    assert!(client.check_if_bucket_exists("my-bucket").await.unwrap());
+
+    server.push_reply(200, "file contents");
+    let body = client.download_file("my-bucket", "a.bin").await.unwrap();
+
+    assert_eq!(body, b"file contents");
+    assert_eq!(server.request_count(), 2);
+}
+
+// ---------------------------------------------------------------------------
 // Debug mode
 // ---------------------------------------------------------------------------
 
@@ -596,7 +749,12 @@ async fn every_verb_survives_debug_mode() {
     server.push_reply(204, "");
     client.delete_file("my-bucket", "a.bin").await.unwrap();
 
-    assert_eq!(server.request_count(), 5);
+    client.check_if_bucket_exists("my-bucket").await.unwrap();
+
+    server.push_reply(200, location_answer("eu-west-1").as_str());
+    client.get_bucket_location("my-bucket").await.unwrap();
+
+    assert_eq!(server.request_count(), 7);
     for captured in server.captured() {
         assert!(
             captured.signature_valid,

@@ -187,6 +187,8 @@ async fn serve_connection(
 
         let signature_valid = verify_signature(&method, &target, &headers, &body);
 
+        let answering_a_head = method.eq_ignore_ascii_case("HEAD");
+
         state.captured.lock().unwrap().push(Captured {
             method,
             target,
@@ -202,7 +204,7 @@ async fn serve_connection(
             .pop_front()
             .unwrap_or((200, String::new()));
 
-        write_response(&mut stream, status_code, &reply_body).await?;
+        write_response(&mut stream, status_code, &reply_body, answering_a_head).await?;
     }
 }
 
@@ -268,9 +270,11 @@ async fn write_response(
     stream: &mut tokio::net::TcpStream,
     status_code: u16,
     body: &str,
+    answering_a_head: bool,
 ) -> std::io::Result<()> {
     let reason = match status_code {
         200 => "OK",
+        400 => "Bad Request",
         204 => "No Content",
         206 => "Partial Content",
         403 => "Forbidden",
@@ -282,9 +286,19 @@ async fn write_response(
         _ => "Unknown",
     };
 
-    // 204 carries no content at all - not even a zero Content-Length - which is exactly
-    // the shape a client that only accepts 200 used to trip over.
-    let response = if status_code == 204 {
+    // The answer to a HEAD carries the headers of the GET that was not made - including
+    // `Content-Length` - but **no body**. Writing one would be read as the start of the
+    // next response on this keep-alive connection.
+    let response = if answering_a_head {
+        format!(
+            "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nContent-Type: application/xml\r\nConnection: keep-alive\r\n\r\n",
+            status_code,
+            reason,
+            body.len()
+        )
+    } else if status_code == 204 {
+        // 204 carries no content at all - not even a zero Content-Length - which is
+        // exactly the shape a client that only accepts 200 used to trip over.
         format!("HTTP/1.1 204 {}\r\nConnection: keep-alive\r\n\r\n", reason)
     } else {
         format!(
