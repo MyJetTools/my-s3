@@ -537,6 +537,94 @@ async fn no_other_request_grew_a_body() {
 }
 
 // ---------------------------------------------------------------------------
+// Debug mode
+// ---------------------------------------------------------------------------
+
+/// Tracing must be a pure observation: the same bytes go out, and the signature still
+/// verifies. Routing a request through `FlUrl`'s `*_with_debug` variants is the kind of
+/// change that could quietly compile the request differently.
+#[tokio::test]
+async fn debug_mode_does_not_change_what_goes_on_the_wire() {
+    let server = FakeS3::start().await;
+
+    let quiet = server.client_in_region("eu-west-1");
+    quiet.create_bucket("my-bucket").await.unwrap();
+
+    let loud = server.client_in_region("eu-west-1").debug_to_console();
+    loud.create_bucket("my-bucket").await.unwrap();
+
+    let captured = server.captured();
+    assert_eq!(captured.len(), 2);
+    assert_eq!(captured[0].body, captured[1].body);
+    assert_eq!(captured[0].target, captured[1].target);
+    assert!(
+        captured[1].signature_valid,
+        "debug mode must not disturb the signature: {:?}",
+        captured[1]
+    );
+}
+
+/// Every verb has its own `FlUrl` debug entry point, including the streamed one, so
+/// each path is exercised - a missing one would show up as a compile error at best and
+/// a silently untraced request at worst.
+#[tokio::test]
+async fn every_verb_survives_debug_mode() {
+    let server = FakeS3::start().await;
+    let client = server.client_in_region("eu-west-1").debug_to_console();
+
+    client.create_bucket("my-bucket").await.unwrap();
+
+    client
+        .upload("my-bucket", "a.bin", b"hello".to_vec(), UPLOAD_TIMEOUT)
+        .await
+        .unwrap();
+
+    client
+        .upload_streamed(
+            "my-bucket",
+            "b.bin",
+            body_from(b"streamed".to_vec(), 4),
+            8,
+            UPLOAD_TIMEOUT,
+        )
+        .await
+        .unwrap();
+
+    server.push_reply(200, "contents");
+    client.download_file("my-bucket", "a.bin").await.unwrap();
+
+    server.push_reply(204, "");
+    client.delete_file("my-bucket", "a.bin").await.unwrap();
+
+    assert_eq!(server.request_count(), 5);
+    for captured in server.captured() {
+        assert!(
+            captured.signature_valid,
+            "{} {} lost its signature under debug mode",
+            captured.method, captured.target
+        );
+    }
+}
+
+/// The failure path is the one debug mode is turned on for, so it has to survive it -
+/// and still come back typed rather than as a printed message.
+#[tokio::test]
+async fn a_failure_under_debug_mode_is_still_typed() {
+    let server = FakeS3::start().await;
+    let client = server.client_in_region("eu-west-1").debug_to_console();
+
+    server.push_reply(
+        400,
+        "<Error><Code>IllegalLocationConstraintException</Code><Message>The unspecified location constraint is incompatible for the region specific endpoint this request was sent to.</Message></Error>",
+    );
+
+    let err = client.create_bucket("my-bucket").await.unwrap_err();
+
+    assert_eq!(err.get_status_code(), Some(400));
+    assert!(!err.is_retryable());
+}
+
+// ---------------------------------------------------------------------------
 // CreateBucket: creating one that is already there
 // ---------------------------------------------------------------------------
 

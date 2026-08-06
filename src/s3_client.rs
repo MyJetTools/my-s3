@@ -103,10 +103,11 @@ impl S3Client {
 
         let fl_url = super::utils::sign_request(self, fl_url, "PUT", content.as_slice())?;
 
-        self.trace_request("PUT", &fl_url, DebugBody::Opaque(content.len()));
-
-        let response = fl_url
-            .put(flurl::body::HttpRequestBody::from_raw_data(content, None))
+        let response = self
+            .send_put(
+                fl_url,
+                flurl::body::HttpRequestBody::from_raw_data(content, None),
+            )
             .await?;
 
         self.expect_success(response).await
@@ -215,10 +216,8 @@ impl S3Client {
         let fl_url =
             super::utils::sign_request_with_payload_hash(self, fl_url, "PUT", UNSIGNED_PAYLOAD)?;
 
-        self.trace_request("PUT", &fl_url, DebugBody::Opaque(content_length));
-
-        let response = fl_url
-            .put_request_streamed(RequestBodyStream::from(body), Some(content_length))
+        let response = self
+            .send_put_streamed(fl_url, RequestBodyStream::from(body), content_length)
             .await?;
 
         self.expect_success(response).await
@@ -357,9 +356,7 @@ impl S3Client {
             None => fl_url,
         };
 
-        self.trace_request("GET", &fl_url, DebugBody::None);
-
-        let fl_url_response = fl_url.get().await?;
+        let fl_url_response = self.send_get(fl_url).await?;
 
         let status_code = fl_url_response.get_status_code();
 
@@ -407,9 +404,7 @@ impl S3Client {
 
         let fl_url = super::utils::sign_request(self, fl_url, "DELETE", [].as_slice())?;
 
-        self.trace_request("DELETE", &fl_url, DebugBody::None);
-
-        let fl_url_response = fl_url.delete().await?;
+        let fl_url_response = self.send_delete(fl_url).await?;
 
         self.expect_success(fl_url_response).await
     }
@@ -443,16 +438,6 @@ impl S3Client {
             configuration.as_deref().unwrap_or_default(),
         )?;
 
-        self.trace_request(
-            "PUT",
-            &fl_url,
-            match configuration.as_deref() {
-                // Small, and its content is the whole point of the call.
-                Some(configuration) => DebugBody::Text(configuration),
-                None => DebugBody::None,
-            },
-        );
-
         let body = match configuration {
             Some(configuration) => {
                 flurl::body::HttpRequestBody::from_raw_data(configuration, Some("application/xml"))
@@ -460,7 +445,7 @@ impl S3Client {
             None => flurl::body::HttpRequestBody::empty(),
         };
 
-        let fl_url_response = fl_url.put(body).await?;
+        let fl_url_response = self.send_put(fl_url, body).await?;
 
         self.expect_success(fl_url_response).await
     }
@@ -501,26 +486,85 @@ impl S3Client {
         Err(detect_error(status_code, &body))
     }
 
-    /// Prints the request that is about to go out, when [`Self::debug_to_console`] is
-    /// on. Called **after** signing, so what it reports is what the socket will carry.
-    fn trace_request(&self, method: &str, fl_url: &flurl::FlUrl, body: DebugBody<'_>) {
+    /// Sends a `GET`, tracing the request through `FlUrl` itself when
+    /// [`Self::debug_to_console`] is on.
+    ///
+    /// The trace is printed **before** the `?`, so a request that never got an answer -
+    /// a timeout, a refused connection - is still shown. That is the case a trace is
+    /// most needed for.
+    async fn send_get(&self, fl_url: flurl::FlUrl) -> Result<FlUrlResponse, S3Error> {
         if !self.debug_to_console {
-            return;
+            return Ok(fl_url.get().await?);
         }
 
-        // Read back out of the url builder rather than rebuilt from `endpoint` and the
-        // segments: the builder percent-encodes as it goes, and a trace that shows
-        // something other than what was sent is worse than no trace at all.
-        let url = format!(
-            "{}{}",
-            fl_url.url_builder.get_scheme_and_host(),
-            fl_url.url_builder.get_path_and_query()
-        );
+        let mut request = String::new();
+        let response = fl_url.get_with_debug(&mut request).await;
+        println!("{} --> {}", DEBUG_PREFIX, request);
 
-        println!("{}", format_request_trace(method, url.as_str(), body));
+        Ok(response?)
+    }
+
+    async fn send_delete(&self, fl_url: flurl::FlUrl) -> Result<FlUrlResponse, S3Error> {
+        if !self.debug_to_console {
+            return Ok(fl_url.delete().await?);
+        }
+
+        let mut request = String::new();
+        let response = fl_url.delete_with_debug(&mut request).await;
+        println!("{} --> {}", DEBUG_PREFIX, request);
+
+        Ok(response?)
+    }
+
+    async fn send_put(
+        &self,
+        fl_url: flurl::FlUrl,
+        body: flurl::body::HttpRequestBody,
+    ) -> Result<FlUrlResponse, S3Error> {
+        if !self.debug_to_console {
+            return Ok(fl_url.put(body).await?);
+        }
+
+        // `FlUrl` dumps the body in full here, with no size limit - which is what makes
+        // this useful for the `CreateBucket` XML and expensive for a large object. It
+        // costs a copy of the payload, and it is opt-in, so that is the debugging price.
+        let mut request = String::new();
+        let response = fl_url.put_with_debug(body, &mut request).await;
+        println!("{} --> {}", DEBUG_PREFIX, request);
+
+        Ok(response?)
+    }
+
+    /// The streamed counterpart. `FlUrl` traces the head only here - a streamed payload
+    /// exists only as it is written to the socket, so printing it would mean buffering
+    /// the very thing streaming avoids.
+    async fn send_put_streamed(
+        &self,
+        fl_url: flurl::FlUrl,
+        body: RequestBodyStream<Vec<u8>>,
+        content_length: usize,
+    ) -> Result<FlUrlResponse, S3Error> {
+        if !self.debug_to_console {
+            return Ok(fl_url
+                .put_request_streamed(body, Some(content_length))
+                .await?);
+        }
+
+        let mut request = String::new();
+        let response = fl_url
+            .put_request_streamed_with_debug(body, Some(content_length), &mut request)
+            .await;
+        println!("{} --> {}", DEBUG_PREFIX, request);
+
+        Ok(response?)
     }
 
     /// Prints the answer, when [`Self::debug_to_console`] is on.
+    ///
+    /// `FlUrl` traces requests but not answers, and it cannot: `receive_body` consumes
+    /// the body and `get_body_as_stream` hands it over, so tracing it there would mean
+    /// buffering an entire downloaded object. Here the body has been read already and
+    /// the outcome is known, which is what makes the size/content asymmetry possible.
     ///
     /// `body` is `None` when the outcome was decided without reading it - a `416`, or a
     /// server that ignored `Range` and is about to send a whole object nobody asked
@@ -532,40 +576,6 @@ impl S3Client {
 
         println!("{}", format_response_trace(status_code, body));
     }
-}
-
-/// What the trace says about the body of a request.
-enum DebugBody<'s> {
-    /// No body at all.
-    None,
-    /// A control body small enough that its content *is* what is being debugged - the
-    /// `CreateBucket` location constraint.
-    Text(&'s [u8]),
-    /// An object payload: only its size is traced. It is opaque and can be arbitrarily
-    /// large, so printing it would flood the console and say nothing.
-    Opaque(usize),
-}
-
-fn format_request_trace(method: &str, url: &str, body: DebugBody<'_>) -> String {
-    let mut result = format!("{} --> {} {}", DEBUG_PREFIX, method, url);
-
-    match body {
-        DebugBody::None => {}
-        DebugBody::Text(body) => result.push_str(
-            format!(
-                "\n{}     body {} bytes: {}",
-                DEBUG_PREFIX,
-                body.len(),
-                String::from_utf8_lossy(body)
-            )
-            .as_str(),
-        ),
-        DebugBody::Opaque(len) => {
-            result.push_str(format!("\n{}     body {} bytes", DEBUG_PREFIX, len).as_str())
-        }
-    }
-
-    result
 }
 
 /// A failure is printed in full: that body is the `<Error><Code>` saying why, and it is
@@ -740,6 +750,43 @@ mod tests {
                 )
             );
         }
+    }
+
+    /// The asymmetry the whole trace exists for: a failure is the `<Error><Code>` that
+    /// explains itself, a success is an object nobody wants on the console.
+    #[test]
+    fn a_failed_answer_is_traced_in_full_a_successful_one_by_size() {
+        let error = "<Error><Code>IllegalLocationConstraintException</Code></Error>";
+
+        assert_eq!(
+            format_response_trace(400, Some(error.as_bytes())),
+            format!("[my-s3] <-- 400, body {} bytes: {}", error.len(), error)
+        );
+
+        assert_eq!(
+            format_response_trace(200, Some(&vec![0u8; 1_048_576])),
+            "[my-s3] <-- 200, body 1048576 bytes"
+        );
+    }
+
+    /// A body that was never read must not be reported as an empty one - 416, and the
+    /// server that ignored `Range` and started sending the whole object, both end up
+    /// here.
+    #[test]
+    fn an_unread_body_says_so() {
+        assert_eq!(
+            format_response_trace(416, None),
+            "[my-s3] <-- 416, body not read"
+        );
+    }
+
+    /// 204 has no body and is still a success, so it must not be traced as a failure.
+    #[test]
+    fn a_204_is_traced_as_the_success_it_is() {
+        assert_eq!(
+            format_response_trace(204, Some(&[])),
+            "[my-s3] <-- 204, body 0 bytes"
+        );
     }
 
     #[test]
