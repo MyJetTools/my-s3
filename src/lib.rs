@@ -6,3 +6,7 @@ mod utils;
 pub use error::*;
 pub use region::*;
 mod xml;
+mod list_objects;
+pub use list_objects::*;
+mod download_stream;
+pub use download_stream::*;

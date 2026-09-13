@@ -49,9 +49,19 @@ impl Captured {
     }
 }
 
+/// One queued answer.
+struct Reply {
+    status_code: u16,
+    body: String,
+    /// A `Content-Length` to announce instead of the real one, after which the
+    /// connection is closed. That is the shape of a download that dies mid-object, and
+    /// it is the one case a client can mistake for a complete, short file.
+    lie_about_length: Option<usize>,
+}
+
 struct State {
     /// Replies to hand out in order; an empty queue means "200 with no body".
-    replies: Mutex<VecDeque<(u16, String)>>,
+    replies: Mutex<VecDeque<Reply>>,
     captured: Mutex<Vec<Captured>>,
 }
 
@@ -94,11 +104,23 @@ impl FakeS3 {
 
     /// Queues the next reply. Without this the server answers 200 with an empty body.
     pub fn push_reply(&self, status_code: u16, body: &str) {
-        self.state
-            .replies
-            .lock()
-            .unwrap()
-            .push_back((status_code, body.to_string()));
+        self.state.replies.lock().unwrap().push_back(Reply {
+            status_code,
+            body: body.to_string(),
+            lie_about_length: None,
+        });
+    }
+
+    /// Queues a 200 that announces `declared_length` bytes, sends `body` (which is
+    /// shorter), and hangs up - a download the network cut in half. A client that takes
+    /// the end of the socket for the end of the object writes out a truncated file and
+    /// reports success.
+    pub fn push_truncated_reply(&self, body: &str, declared_length: usize) {
+        self.state.replies.lock().unwrap().push_back(Reply {
+            status_code: 200,
+            body: body.to_string(),
+            lie_about_length: Some(declared_length),
+        });
     }
 
     pub fn captured(&self) -> Vec<Captured> {
@@ -197,14 +219,26 @@ async fn serve_connection(
             signature_valid,
         });
 
-        let (status_code, reply_body) = state
-            .replies
-            .lock()
-            .unwrap()
-            .pop_front()
-            .unwrap_or((200, String::new()));
+        let reply = state.replies.lock().unwrap().pop_front().unwrap_or(Reply {
+            status_code: 200,
+            body: String::new(),
+            lie_about_length: None,
+        });
 
-        write_response(&mut stream, status_code, &reply_body, answering_a_head).await?;
+        write_response(
+            &mut stream,
+            reply.status_code,
+            &reply.body,
+            answering_a_head,
+            reply.lie_about_length,
+        )
+        .await?;
+
+        // The half-sent body is only a truncation if the connection then ends; keeping
+        // it open would just look like a slow server.
+        if reply.lie_about_length.is_some() {
+            return Ok(());
+        }
     }
 }
 
@@ -271,6 +305,7 @@ async fn write_response(
     status_code: u16,
     body: &str,
     answering_a_head: bool,
+    lie_about_length: Option<usize>,
 ) -> std::io::Result<()> {
     let reason = match status_code {
         200 => "OK",
@@ -289,6 +324,15 @@ async fn write_response(
     // The answer to a HEAD carries the headers of the GET that was not made - including
     // `Content-Length` - but **no body**. Writing one would be read as the start of the
     // next response on this keep-alive connection.
+    if let Some(declared_length) = lie_about_length {
+        let response = format!(
+            "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\nConnection: keep-alive\r\n\r\n{}",
+            status_code, reason, declared_length, body
+        );
+        stream.write_all(response.as_bytes()).await?;
+        return stream.flush().await;
+    }
+
     let response = if answering_a_head {
         format!(
             "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nContent-Type: application/xml\r\nConnection: keep-alive\r\n\r\n",
@@ -366,22 +410,7 @@ fn verify_signature(method: &str, target: &str, headers: &[(String, String)], bo
         None => (target, None),
     };
 
-    let canonical_query = match query {
-        Some(query) if !query.is_empty() => {
-            let mut pairs: Vec<(&str, &str)> = query
-                .split('&')
-                .filter(|pair| !pair.is_empty())
-                .map(|pair| pair.split_once('=').unwrap_or((pair, "")))
-                .collect();
-            pairs.sort_unstable();
-            pairs
-                .iter()
-                .map(|(name, value)| format!("{}={}", name, value))
-                .collect::<Vec<_>>()
-                .join("&")
-        }
-        _ => String::new(),
-    };
+    let canonical_query = canonical_query(query.unwrap_or_default());
 
     let canonical_request = format!(
         "{}\n{}\n{}\nhost:{}\nx-amz-content-sha256:{}\nx-amz-date:{}\n\nhost;x-amz-content-sha256;x-amz-date\n{}",
@@ -402,6 +431,92 @@ fn verify_signature(method: &str, target: &str, headers: &[(String, String)], bo
     mac.update(string_to_sign.as_bytes());
 
     hex::encode(mac.finalize().into_bytes()) == expected_signature
+}
+
+/// Rebuilds the canonical query string the way a real S3 does - which is **not** the way
+/// the client wrote it.
+///
+/// This is the half of SigV4 that catches a client encoding its query by the wrong rule.
+/// The server does not take the query off the wire as-is: it decodes each name and value
+/// and re-encodes them by the RFC 3986 rule SigV4 cites - unreserved is `A-Za-z0-9-_.~`,
+/// everything else is `%XX` - and only then sorts. A client that sent a space as `+`
+/// therefore signed `a+b` while the server signs `a%2Bb`, and the request is refused as
+/// `SignatureDoesNotMatch`. Taking the pairs verbatim here would have made this server
+/// agree with exactly that bug.
+///
+/// Decoding is percent-decoding **only**: `+` is a literal plus in an S3 query string,
+/// not a space. That is what makes `prefix=a+b` a request for the prefix `a+b` rather
+/// than `a b`, and it is why sending `+` for a space is two bugs rather than one.
+///
+/// The **path** is deliberately left alone by the caller: S3 is documented as the one
+/// service that does not normalize or re-encode the URI path, so there the canonical
+/// form really is the bytes that were sent.
+pub fn canonical_query(query: &str) -> String {
+    if query.is_empty() {
+        return String::new();
+    }
+
+    let mut pairs: Vec<(String, String)> = query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| match pair.split_once('=') {
+            Some((name, value)) => (uri_encode(&percent_decode(name)), uri_encode(&percent_decode(value))),
+            None => (uri_encode(&percent_decode(pair)), String::new()),
+        })
+        .collect();
+
+    pairs.sort_unstable();
+
+    pairs
+        .iter()
+        .map(|(name, value)| format!("{}={}", name, value))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// `%XX` back to bytes. An invalid escape is left as the literal text it is, which is
+/// what keeps a malformed query a signature failure rather than a panic.
+fn percent_decode(src: &str) -> Vec<u8> {
+    let bytes = src.as_bytes();
+    let mut result = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).ok();
+            if let Some(byte) = hex.and_then(|hex| u8::from_str_radix(hex, 16).ok()) {
+                result.push(byte);
+                index += 3;
+                continue;
+            }
+        }
+
+        result.push(bytes[index]);
+        index += 1;
+    }
+
+    result
+}
+
+/// SigV4's `UriEncode`, written out independently of the client's.
+fn uri_encode(src: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut result = String::with_capacity(src.len());
+
+    for byte in src {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                result.push(*byte as char)
+            }
+            _ => {
+                result.push('%');
+                result.push(HEX[(*byte >> 4) as usize] as char);
+                result.push(HEX[(*byte & 0x0F) as usize] as char);
+            }
+        }
+    }
+
+    result
 }
 
 fn derive_signing_key(secret_key: &str, date: &str, region: &str, service: &str) -> Vec<u8> {

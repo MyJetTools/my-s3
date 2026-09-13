@@ -121,6 +121,62 @@ fn canonical_query_string(query: Option<&str>) -> String {
     result
 }
 
+/// URI-encodes one query-string name or value the way SigV4 requires.
+///
+/// **This exists because `FlUrl` encodes queries by a different rule and the difference
+/// is a 403.** `FlUrl::append_query_param` runs the value through
+/// `my_http_utils::url_encoder`, which is an `x-www-form-urlencoded` encoder: a space
+/// becomes `+`, and `!` is left alone. SigV4 - and RFC 3986, which it cites - says the
+/// unreserved set is exactly `A-Za-z0-9-_.~` and that **everything** else is `%XX`, so a
+/// space is `%20` and `!` is `%21`.
+///
+/// Both halves of that gap bite, and neither is visible locally:
+///
+/// * S3 does not read `+` in a query value as a space, so `prefix=a+b` would list the
+///   prefix `a+b` - a listing that silently comes back empty.
+/// * The server rebuilds the canonical query from what arrived, re-encoding it by the
+///   RFC 3986 rule, so its `%2B` never matches our `+` and the request is refused as
+///   `SignatureDoesNotMatch` - which reads as a credentials problem.
+///
+/// A `prefix` almost always contains `/`, and a continuation token is base64 and
+/// contains `+ / =`, so this is the normal case, not an edge one.
+///
+/// Encoding runs over the UTF-8 **bytes**, which is what makes a non-ASCII key encode to
+/// the same `%XX` sequence the server will re-derive.
+pub fn encode_uri_component(src: &str, dest: &mut String) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+    for byte in src.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                dest.push(*byte as char)
+            }
+            _ => {
+                dest.push('%');
+                dest.push(HEX[(*byte >> 4) as usize] as char);
+                dest.push(HEX[(*byte & 0x0F) as usize] as char);
+            }
+        }
+    }
+}
+
+/// Appends `&name=value` to a query string being built by hand, URI-encoding both
+/// halves. A `None` value appends nothing at all - S3 tells "not asked for" from
+/// "asked for, empty" by the absence of the parameter.
+pub fn append_query_param(query: &mut String, name: &str, value: Option<&str>) {
+    let Some(value) = value else {
+        return;
+    };
+
+    if !query.is_empty() {
+        query.push('&');
+    }
+
+    encode_uri_component(name, query);
+    query.push('=');
+    encode_uri_component(value, query);
+}
+
 pub fn get_signature_key(secret_key: &str, date: &str, region: &str, service: &str) -> Vec<u8> {
     let k_secret = format!("AWS4{}", secret_key).into_bytes();
     let k_date = HmacSha256::new_from_slice(&k_secret)
@@ -242,6 +298,145 @@ mod tests {
         assert_eq!(
             canonical_query_string(Some("uploadId=2%7EabC.d-e_f%2Bg")),
             "uploadId=2%7EabC.d-e_f%2Bg"
+        );
+    }
+
+    fn encode(value: &str) -> String {
+        let mut result = String::new();
+        encode_uri_component(value, &mut result);
+        result
+    }
+
+    /// The rule itself: `A-Za-z0-9-_.~` and nothing else survives. `~` in particular is
+    /// unreserved and must stay literal - encoding it is as wrong as not encoding a
+    /// space.
+    #[test]
+    fn only_the_unreserved_set_survives_uri_encoding() {
+        assert_eq!(
+            encode("abcXYZ019-_.~"),
+            "abcXYZ019-_.~",
+            "the unreserved set must pass through untouched"
+        );
+
+        for (raw, encoded) in [
+            (" ", "%20"),
+            ("/", "%2F"),
+            ("+", "%2B"),
+            ("=", "%3D"),
+            ("!", "%21"),
+            ("*", "%2A"),
+            ("'", "%27"),
+            ("(", "%28"),
+            (")", "%29"),
+            ("%", "%25"),
+            ("&", "%26"),
+            ("?", "%3F"),
+            ("#", "%23"),
+            (":", "%3A"),
+            ("@", "%40"),
+            (",", "%2C"),
+            (";", "%3B"),
+            ("$", "%24"),
+        ] {
+            assert_eq!(encode(raw), encoded, "wrong encoding for {:?}", raw);
+        }
+    }
+
+    /// **The divergence this function exists for.** `FlUrl`'s own query encoder is an
+    /// `x-www-form-urlencoded` one: a space becomes `+` and `!` is left alone. Either
+    /// would be a 403 that reads as a credentials problem, because the server rebuilds
+    /// the canonical query by the RFC 3986 rule and never sees ours.
+    #[test]
+    fn a_space_is_percent_20_and_never_a_plus() {
+        assert_eq!(encode("a b"), "a%20b");
+        assert!(!encode("a b").contains('+'));
+        // And a literal plus is not a space either - the two must stay distinguishable.
+        assert_eq!(encode("a+b"), "a%2Bb");
+    }
+
+    /// The parameter that is almost never free of `/`: a folder prefix, with a space in
+    /// it for good measure. This exact value is the one that used to come back as an
+    /// empty listing *and* a signature mismatch at the same time.
+    #[test]
+    fn a_folder_prefix_is_encoded_the_way_sigv4_reads_it() {
+        assert_eq!(
+            encode("photos/2024 summer/"),
+            "photos%2F2024%20summer%2F"
+        );
+    }
+
+    /// A continuation token is base64 and therefore carries `+`, `/` and `=` - the three
+    /// characters a query string is least able to leave alone. Sending any of them raw
+    /// would end the parameter early or be re-read as a different token.
+    #[test]
+    fn a_continuation_token_survives_its_base64_punctuation() {
+        assert_eq!(
+            encode("1ueGcxLPRx1Tr/XYExHnhbYLgveDs2J/wm36Hy4vbOwM="),
+            "1ueGcxLPRx1Tr%2FXYExHnhbYLgveDs2J%2Fwm36Hy4vbOwM%3D"
+        );
+    }
+
+    /// Encoding runs over UTF-8 bytes, not chars, which is the only way the server's
+    /// re-encoding of the same key lands on the same string. Hex digits are uppercase,
+    /// as RFC 3986 and every AWS SDK write them.
+    #[test]
+    fn non_ascii_is_encoded_byte_wise_in_uppercase_hex() {
+        assert_eq!(encode("Пример"), "%D0%9F%D1%80%D0%B8%D0%BC%D0%B5%D1%80");
+        assert_eq!(encode("café"), "caf%C3%A9");
+        assert_eq!(encode("\u{1F600}"), "%F0%9F%98%80");
+    }
+
+    /// Neither `=` nor `&` can survive encoding, which is what lets
+    /// `canonical_query_string` split the query on them without ambiguity.
+    #[test]
+    fn an_encoded_value_can_not_forge_a_query_separator() {
+        let mut query = String::new();
+        append_query_param(&mut query, "prefix", Some("a=1&b=2"));
+
+        assert_eq!(query, "prefix=a%3D1%26b%3D2");
+        assert_eq!(query.matches('=').count(), 1);
+        assert_eq!(query.matches('&').count(), 0);
+    }
+
+    /// A parameter that was not asked for is not sent at all. S3 reads `delimiter=` as
+    /// "with an empty delimiter", which is a different request from "no delimiter".
+    #[test]
+    fn a_none_parameter_is_not_sent() {
+        let mut query = String::from("list-type=2");
+
+        append_query_param(&mut query, "prefix", None);
+        append_query_param(&mut query, "delimiter", None);
+
+        assert_eq!(query, "list-type=2");
+
+        // An empty value, on the other hand, was asked for and is sent.
+        append_query_param(&mut query, "prefix", Some(""));
+        assert_eq!(query, "list-type=2&prefix=");
+    }
+
+    /// The `&` goes between parameters and never in front of the first one - including
+    /// when the query starts out empty.
+    #[test]
+    fn parameters_are_joined_with_a_single_ampersand() {
+        let mut query = String::new();
+
+        append_query_param(&mut query, "a", Some("1"));
+        append_query_param(&mut query, "b", Some("2"));
+
+        assert_eq!(query, "a=1&b=2");
+    }
+
+    /// The whole reason this is safe to sign: what we build is already canonical-ready,
+    /// so `canonical_query_string` only has to sort it.
+    #[test]
+    fn a_hand_built_query_canonicalises_by_sorting_alone() {
+        let mut query = String::from("list-type=2");
+        append_query_param(&mut query, "prefix", Some("photos/2024 summer/"));
+        append_query_param(&mut query, "delimiter", Some("/"));
+
+        assert_eq!(
+            canonical_query_string(Some(query.as_str())),
+            "delimiter=%2F&list-type=2&prefix=photos%2F2024%20summer%2F"
         );
     }
 

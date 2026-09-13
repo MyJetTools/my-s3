@@ -4,7 +4,7 @@ use flurl::FlUrlResponse;
 use my_http_client::RequestBodyStream;
 use tokio::sync::mpsc::Receiver;
 
-use super::{S3Error, S3Region};
+use super::{S3DownloadStream, S3Error, S3ListObjectsPage, S3ListObjectsRequest, S3Region};
 
 /// `x-amz-content-sha256` value that tells S3 the payload is not covered by the
 /// signature. Required for a streamed body: the header has to be signed before the
@@ -518,6 +518,165 @@ impl S3Client {
         }
 
         Err(detect_error(status_code, &[]))
+    }
+
+    /// One page of a bucket's contents - `GET /{bucket}?list-type=2`.
+    ///
+    /// With a `delimiter` this is a directory listing: `common_prefixes` are the
+    /// folders, `objects` are the files at this level. Without one it is a flat walk of
+    /// every key under the prefix.
+    ///
+    /// A page is not the whole bucket. S3 caps a page at 1000 entries and may answer
+    /// with fewer for reasons of its own, so
+    /// [`S3ListObjectsPage::next_continuation_token`] - not the number of entries that
+    /// came back - is what says whether to ask again:
+    ///
+    /// ```no_run
+    /// # async fn doc(s3: &my_s3::S3Client) -> Result<(), my_s3::S3Error> {
+    /// let mut token = None;
+    ///
+    /// loop {
+    ///     let page = s3
+    ///         .list_objects_v2(
+    ///             "my-bucket",
+    ///             my_s3::S3ListObjectsRequest {
+    ///                 prefix: Some("photos/"),
+    ///                 delimiter: Some("/"),
+    ///                 continuation_token: token.as_deref(),
+    ///                 ..Default::default()
+    ///             },
+    ///         )
+    ///         .await?;
+    ///
+    ///     // ... use page.common_prefixes and page.objects ...
+    ///
+    ///     token = page.next_continuation_token;
+    ///     if token.is_none() {
+    ///         break;
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// The `prefix` and `delimiter` have to be repeated unchanged on every page -
+    /// a continuation token resumes a listing, it does not describe one.
+    ///
+    /// # Why the query is built by hand
+    ///
+    /// The parameters are URI-encoded here and appended as a raw ending rather than
+    /// through `FlUrl::append_query_param`, because `FlUrl` encodes a query by the
+    /// `x-www-form-urlencoded` rule and SigV4 needs the RFC 3986 one. The difference is
+    /// a space (`+` versus `%20`), and a `prefix` with a space in it would otherwise be
+    /// both mis-signed and mis-read. `utils::encode_uri_component` is where the whole
+    /// argument lives.
+    pub async fn list_objects_v2(
+        &self,
+        bucket_name: &str,
+        request: S3ListObjectsRequest<'_>,
+    ) -> Result<S3ListObjectsPage, S3Error> {
+        // `max-keys` is a number in the request and a string on the wire; it has to
+        // outlive the borrow the query builder takes.
+        let max_keys = request.max_keys.map(|max_keys| max_keys.to_string());
+
+        let mut query = String::from("list-type=2");
+        super::utils::append_query_param(&mut query, "prefix", request.prefix);
+        super::utils::append_query_param(&mut query, "delimiter", request.delimiter);
+        super::utils::append_query_param(
+            &mut query,
+            "continuation-token",
+            request.continuation_token,
+        );
+        super::utils::append_query_param(&mut query, "max-keys", max_keys.as_deref());
+
+        // Path and query in one raw ending. Appending the bucket as a path segment and
+        // the query raw would work too, except that `append_raw_ending` forces a `/`
+        // ahead of whatever it is given - the request target would become
+        // `/bucket/?list-type=2`, and a trailing slash is one more thing for an
+        // S3-compatible implementation to disagree about. A legal bucket name is
+        // `[a-z0-9.-]`, every character of which URI-encodes to itself, so encoding it
+        // costs nothing and keeps an illegal one signed exactly as it is sent.
+        let mut path_and_query = String::with_capacity(bucket_name.len() + query.len() + 2);
+        path_and_query.push('/');
+        super::utils::encode_uri_component(bucket_name, &mut path_and_query);
+        path_and_query.push('?');
+        path_and_query.push_str(query.as_str());
+
+        let fl_url = flurl::FlUrl::new(self.endpoint.as_str())
+            .append_raw_ending_to_url(path_and_query)
+            .with_retries(3);
+
+        // After the whole url is built, as always: the query is part of the canonical
+        // request.
+        let fl_url = super::utils::sign_request(self, fl_url, "GET", [].as_slice())?;
+
+        let response = self.send_get(fl_url).await?;
+
+        let body = self.read_success_body(response).await?;
+
+        crate::list_objects::parse_list_objects_v2(&body)
+    }
+
+    /// Downloads an object without holding it in memory - `GET /{bucket}/{key}`, body
+    /// left on the socket.
+    ///
+    /// [`Self::download_file`] reads the whole object before it returns, so peak memory
+    /// is the object's size and a large one takes the process with it. This returns as
+    /// soon as the response *head* has arrived, and hands the body over a chunk at a
+    /// time, so an HTTP server can forward an object it could never hold.
+    ///
+    /// The returned [`S3DownloadStream`] carries `Content-Length` and `Content-Type`,
+    /// which is what forwarding it needs, and holds the connection until it is read to
+    /// the end or dropped.
+    ///
+    /// A failure is still reported as a typed error: a non-2xx answer's body is small -
+    /// it is the `<Error><Code>` - so it *is* read, and only a successful one is left
+    /// streaming.
+    ///
+    /// ```no_run
+    /// # async fn doc(s3: &my_s3::S3Client) -> Result<(), my_s3::S3Error> {
+    /// use tokio::io::AsyncWriteExt;
+    ///
+    /// let mut stream = s3.download_file_as_stream("my-bucket", "video.mp4").await?;
+    /// let mut file = tokio::fs::File::create("video.mp4").await.unwrap();
+    ///
+    /// while let Some(chunk) = stream.get_next_chunk().await? {
+    ///     file.write_all(&chunk).await.unwrap();
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn download_file_as_stream(
+        &self,
+        bucket_name: &str,
+        key: &str,
+    ) -> Result<S3DownloadStream, S3Error> {
+        let fl_url = flurl::FlUrl::new(self.endpoint.as_str())
+            .append_path_segment(bucket_name)
+            .append_path_segment(key)
+            .with_retries(3);
+
+        let fl_url = super::utils::sign_request(self, fl_url, "GET", [].as_slice())?;
+
+        let response = self.send_get(fl_url).await?;
+
+        let status_code = response.get_status_code();
+
+        if !is_success(status_code) {
+            // Small, and the only thing that says *why*. Reading it also settles the
+            // connection, which a discarded streaming body would not.
+            let body = response.receive_body().await?;
+            self.trace_response(status_code, Some(&body));
+            return Err(detect_error(status_code, &body));
+        }
+
+        // Deliberately not read: it is the object, and leaving it on the socket is the
+        // whole point. `read_success_body` is therefore not the right tool here, and
+        // calling it would also materialize the body and make `get_body_as_stream`
+        // panic.
+        self.trace_response(status_code, None);
+
+        Ok(S3DownloadStream::from_response(response))
     }
 
     /// [`Self::create_bucket`], but a bucket that is **already ours** is success rather

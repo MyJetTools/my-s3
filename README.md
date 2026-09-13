@@ -1,0 +1,281 @@
+# my-s3
+
+An async S3 client for AWS S3 and S3-compatible storage (Hetzner Object Storage, Ceph
+RGW, MinIO, Wasabi, DigitalOcean Spaces, a private deployment). Signs with SigV4, speaks
+plain HTTP over [`fl-url`](https://github.com/MyJetTools/fl-url), and holds no state
+between calls.
+
+It covers what a service actually does with object storage: put an object, get it back,
+delete it, list a bucket, and make sure the bucket is there. Objects larger than memory
+have a streaming path in both directions. It is deliberately not an SDK — there is no
+versioning, no ACLs, no lifecycle, no presigning.
+
+## Adding it
+
+```toml
+[dependencies]
+my-s3 = { tag = "0.1.1", git = "https://github.com/MyJetTools/my-s3.git" }
+```
+
+The crate depends on `fl-url` with the `with-rust-tls` feature, because S3 is always
+addressed over `https://` and `fl-url` compiles its TLS paths out without a provider
+feature. `with-rust-tls` is pure Rust (no C toolchain) and builds **only on x86_64 and
+aarch64**. On any other architecture, switch `my-s3`'s own dependency to `with-ring-tls`.
+
+## A client
+
+```rust
+use my_s3::S3Client;
+
+let s3 = S3Client::new(
+    "access-key",
+    "secret-key",
+    "fsn1",                                    // region
+    "https://fsn1.your-objectstorage.com",     // endpoint
+);
+```
+
+`S3Client` is cheap, `Send + Sync`, and holds no connection of its own — `fl-url` pools
+those process-wide — so build one at startup and share it by reference.
+
+**The region is not decoration.** It goes into the SigV4 credential scope of every
+request, and the storage checks it against the endpoint that was addressed. Getting it
+wrong is a `403` that reads like a credentials problem. Anything the catalogue does not
+name becomes `S3Region::Other` and is carried through verbatim, so a private Ceph with a
+region of `dc1` works without a code change.
+
+The endpoint is used **path-style** (`https://host/bucket/key`), which is what every
+S3-compatible implementation accepts; virtual-host style is not supported.
+
+### Seeing what goes out
+
+```rust
+let s3 = S3Client::new(/* ... */).debug_to_console();
+```
+
+Prints every request as it is sent, and a failed answer's body in full — that body is the
+`<Error><Code>` that says why. A successful answer is printed as a size, since it is the
+object that was just downloaded. `Authorization` is never printed.
+
+## Buckets
+
+```rust
+s3.create_bucket("my-bucket").await?;
+s3.create_bucket_if_not_exists("my-bucket").await?;   // idempotent
+s3.check_if_bucket_exists("my-bucket").await?;        // -> bool
+s3.get_bucket_location("my-bucket").await?;           // -> S3Region
+```
+
+`create_bucket` places the bucket in the client's own region. Calling it again on a
+bucket you already own is `S3Error::BucketAlreadyOwnedByYou` — which is what S3 answers
+on every restart of a service that ensures its bucket at startup, so use
+`create_bucket_if_not_exists` there. That one absorbs "already ours" and nothing else: a
+name held by **another account** stays an error, because the bucket that exists is then
+not the one you are about to write to.
+
+`check_if_bucket_exists` answers `Ok(false)` for a `404` — "not there" is an answer — but
+keeps `403` an error, since that means either that the name belongs to someone else or
+that the credentials are wrong.
+
+## Uploading
+
+```rust
+s3.upload("my-bucket", "config.json", bytes, Duration::from_secs(30)).await?;
+```
+
+Peak memory is the size of `bytes`. The timeout bounds the whole request, body included;
+it is required rather than defaulted because `fl-url`'s own default of 10 seconds is a
+limit on the *upload*, which silently kills any real one.
+
+For anything whose size is not bounded by construction, stream it:
+
+```rust
+let length = tokio::fs::metadata(path).await?.len() as usize;
+let mut file = tokio::fs::File::open(path).await?;
+let (sender, receiver) = tokio::sync::mpsc::channel(4);   // 4 chunks of backpressure
+
+tokio::spawn(async move {
+    let mut buffer = vec![0u8; 256 * 1024];
+    while let Ok(read) = file.read(&mut buffer).await {
+        if read == 0 || sender.send(buffer[..read].to_vec()).await.is_err() {
+            break;
+        }
+    }
+    // dropping the sender is what terminates the body
+});
+
+s3.upload_streamed("my-bucket", "backup.tar", receiver, length, Duration::from_secs(600))
+    .await?;
+```
+
+Three things the compiler will not tell you:
+
+- **`content_length` must be exact.** It is sent as `Content-Length` (SigV4 requests are
+  not accepted chunked), and HTTP/1.1 gives no way to correct it. Take the length and the
+  data from one source — a file's metadata and that same handle — never compute it twice.
+- **Drop the sender** after the last chunk. That is how the body ends.
+- **The request is attempted once.** `fl-url`'s retries do not apply to a body that is
+  consumed as it is sent. Ask `S3Error::is_retryable`, rebuild the payload from the
+  start, and try again — or let `upload_streamed_with_retries` run that loop for you. Its
+  closure hands back a *fresh* channel per attempt, which is what makes it impossible to
+  accidentally resume a half-drained source.
+
+Retrying an upload is safe: `PutObject` replaces the whole object atomically, so a failed
+attempt leaves either the previous object or nothing, never half of one.
+
+A streamed body is signed as `UNSIGNED-PAYLOAD` — the signature covers the verb, path and
+headers, but not the body, whose hash is not knowable before the body exists. Integrity
+therefore rests on TLS, so use an `https` endpoint. AWS and Ceph both accept this.
+
+## Downloading
+
+```rust
+let bytes = s3.download_file("my-bucket", "config.json").await?;
+let head = s3.download_file_range("my-bucket", "video.mp4", 0, Some(1023)).await?;
+```
+
+`download_file_range` takes **inclusive** byte offsets, following the HTTP `Range`
+semantics: `(0, Some(99))` is the first 100 bytes, and `end = None` reads to the end. A
+server that ignores `Range` and answers `200` with the whole object is reported as an
+error rather than silently handing back far more data than was asked for.
+
+For an object that should not be held in memory:
+
+```rust
+let mut stream = s3.download_file_as_stream("my-bucket", "video.mp4").await?;
+
+// Everything an HTTP response needs in order to forward this.
+let length = stream.content_length;                 // Option<u64>
+let content_type = stream.content_type.as_deref();  // Option<&str>
+
+while let Some(chunk) = stream.get_next_chunk().await? {
+    sink.write_all(&chunk).await?;
+}
+```
+
+This returns as soon as the response *head* has arrived, so peak memory is one chunk
+whatever the object's size — a server can forward an object it could never hold. A
+failure is still typed: a non-2xx body is small (it is the `<Error><Code>`) and is read,
+and only a successful answer is left streaming.
+
+**A body that ends early is an `Err`, never `Ok(None)`.** A connection that breaks
+mid-object must not look like the end of one, or a truncated file gets written out and
+believed. The transport reports a short body as a read error, and `S3DownloadStream`
+additionally counts the bytes and refuses to report the end of a stream that delivered
+fewer than `Content-Length` promised.
+
+The connection is checked out for as long as the stream lives: read it to the end and it
+returns to the pool, drop it early and it is disposed of.
+
+```rust
+s3.delete_file("my-bucket", "config.json").await?;
+```
+
+Deleting is idempotent — a key that was not there is a success, not `KeyNotFound`.
+
+## Listing a bucket
+
+```rust
+use my_s3::S3ListObjectsRequest;
+
+let page = s3.list_objects_v2("my-bucket", S3ListObjectsRequest {
+    prefix: Some("photos/"),
+    delimiter: Some("/"),
+    ..Default::default()
+}).await?;
+
+for folder in &page.common_prefixes {         // "photos/2023/", "photos/2024/"
+    println!("dir  {}", folder);
+}
+for object in &page.objects {
+    println!("file {} ({} bytes)", object.key, object.size);
+}
+```
+
+With a `delimiter` this is a directory listing; without one it is a flat walk of every
+key under the prefix. A `common_prefix` is a **full** prefix ending in the delimiter, so
+it goes straight back in as the next request's `prefix` with no stitching.
+
+Each `S3ObjectInfo` carries `key` (full, and already XML-unescaped), `size`,
+`last_modified` (the storage's own ISO-8601 string) and `etag` (as sent, quotes
+included).
+
+**A page is not the bucket.** S3 caps a page at 1000 entries and may answer with fewer
+for reasons of its own, so `next_continuation_token` — not the number of entries — is what
+says whether to ask again:
+
+```rust
+let mut token = None;
+
+loop {
+    let page = s3.list_objects_v2("my-bucket", S3ListObjectsRequest {
+        prefix: Some("photos/"),
+        delimiter: Some("/"),
+        continuation_token: token.as_deref(),
+        ..Default::default()
+    }).await?;
+
+    // ... use page.common_prefixes and page.objects ...
+
+    token = page.next_continuation_token;
+    if token.is_none() {
+        break;
+    }
+}
+```
+
+The `prefix` and `delimiter` must be repeated unchanged on every page — a continuation
+token resumes a listing, it does not describe one.
+
+A parameter left as `None` is not sent at all. That matters: S3 reads `delimiter=` as
+"with an empty delimiter", which is a different request from no delimiter and would
+flatten a listing that wanted folders.
+
+Two answers are refused rather than passed on, because both would silently under-report a
+bucket: a truncated page with no continuation token, and a body that was cut short by a
+dropped connection.
+
+## Errors
+
+Every call returns `Result<_, S3Error>`. The variant is taken from the `<Error><Code>` in
+the body rather than from the status code, because the status alone is ambiguous — `404`
+is `NoSuchKey` as often as `NoSuchBucket`, `409` is `BucketAlreadyExists` as often as
+`BucketAlreadyOwnedByYou`.
+
+```rust
+match s3.download_file("my-bucket", "maybe.json").await {
+    Ok(bytes) => { /* ... */ }
+    Err(err) if err.is_key_not_found() => { /* no data is not a failure */ }
+    Err(err) if err.is_retryable() => { /* try again */ }
+    Err(err) => return Err(err),
+}
+```
+
+Predicates: `is_key_not_found`, `is_bucket_not_found`, `is_bucket_already_exists`,
+`is_bucket_already_owned_by_you`, `bucket_name_is_taken` (either of the last two),
+`is_no_such_upload`, `is_entity_too_small`, `is_range_not_satisfiable`.
+
+`get_status_code()` gives the number for an unmapped answer, and `is_retryable()` answers
+whether repeating the same request could plausibly succeed: 5xx, 429, a transport
+failure, and the codes S3 asks for a retry by name (`SlowDown`, `RequestTimeout`,
+`RequestTimeTooSkewed`, `InternalError`, `ServiceUnavailable`). A timeout counts as
+retryable — for a large upload that usually means the timeout was too small, and retrying
+without raising it will just time out again.
+
+## Notes
+
+**Signing.** Requests are signed from the url `fl-url` actually built, not from a
+separately formatted bucket/key pair, so the signed bytes and the sent bytes are the same
+bytes by construction. Query parameters are URI-encoded to the RFC 3986 rule SigV4 cites
+rather than the `x-www-form-urlencoded` rule an HTTP client normally uses — a space is
+`%20`, not `+` — because the storage rebuilds the canonical query the same way and a `+`
+there is both a listing that comes back empty and a `SignatureDoesNotMatch`.
+
+**Responses are not trusted.** Every body is bytes the server chose, so nothing in the
+XML reading path may panic on one: a truncated document, a proxy's HTML page, invalid
+UTF-8 and a stray closing tag are all reported as errors.
+
+**Testing.** `cargo test` runs the suite against an S3-compatible server that runs inside
+the test process (`tests/fake_s3`), over a real socket. It re-derives every signature with
+its own code rather than calling into the crate — including rebuilding the canonical query
+the way a real S3 does — so a test that passes is not one that agreed with a bug.

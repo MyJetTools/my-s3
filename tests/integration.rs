@@ -967,3 +967,483 @@ async fn an_inverted_range_is_rejected_before_any_request() {
     assert!(err.to_string().contains("Invalid range"));
     assert_eq!(server.request_count(), 0, "must not hit the network");
 }
+
+// ---------------------------------------------------------------------------
+// ListObjectsV2
+// ---------------------------------------------------------------------------
+
+fn listing_xml() -> &'static str {
+    r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Name>my-bucket</Name>
+  <Prefix>photos/</Prefix>
+  <Delimiter>/</Delimiter>
+  <IsTruncated>false</IsTruncated>
+  <Contents>
+    <Key>photos/cover.jpg</Key>
+    <LastModified>2024-07-01T12:34:56.000Z</LastModified>
+    <ETag>&quot;abc&quot;</ETag>
+    <Size>1048576</Size>
+    <StorageClass>STANDARD</StorageClass>
+  </Contents>
+  <CommonPrefixes><Prefix>photos/2024/</Prefix></CommonPrefixes>
+</ListBucketResult>"#
+}
+
+/// The plainest possible listing: the sub-resource and nothing else.
+#[tokio::test]
+async fn list_objects_asks_for_list_type_2_and_nothing_more() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    server.push_reply(200, listing_xml());
+
+    client
+        .list_objects_v2("my-bucket", my_s3::S3ListObjectsRequest::default())
+        .await
+        .unwrap();
+
+    let captured = &server.captured()[0];
+
+    assert_eq!(captured.method, "GET");
+    // No trailing slash on the bucket: `/my-bucket`, not `/my-bucket/`.
+    assert_eq!(captured.target, "/my-bucket?list-type=2");
+    assert!(captured.signature_valid);
+    assert!(captured.body.is_empty());
+}
+
+/// A parameter that was not asked for must not appear at all - `delimiter=` is a
+/// different request from no delimiter, and would flatten a listing that wanted folders.
+#[tokio::test]
+async fn parameters_that_were_not_asked_for_are_not_sent() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    server.push_reply(200, listing_xml());
+
+    client
+        .list_objects_v2(
+            "my-bucket",
+            my_s3::S3ListObjectsRequest {
+                delimiter: Some("/"),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let target = &server.captured()[0].target;
+
+    assert_eq!(target, "/my-bucket?list-type=2&delimiter=%2F");
+    assert!(!target.contains("prefix"));
+    assert!(!target.contains("continuation-token"));
+    assert!(!target.contains("max-keys"));
+}
+
+/// **The signing case.** A folder prefix carries `/`, and this one also carries a space.
+/// `FlUrl`'s own query encoder would send `photos%2F2024+summer%2F`: S3 would read the
+/// `+` as a plus rather than a space and answer with an empty listing, and its own
+/// canonical query would say `%20` where ours said `+`, so the request would be refused
+/// as `SignatureDoesNotMatch` first.
+#[tokio::test]
+async fn a_prefix_with_a_slash_and_a_space_is_uri_encoded_not_form_encoded() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    server.push_reply(200, listing_xml());
+
+    client
+        .list_objects_v2(
+            "my-bucket",
+            my_s3::S3ListObjectsRequest {
+                prefix: Some("photos/2024 summer/"),
+                delimiter: Some("/"),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let captured = &server.captured()[0];
+
+    assert_eq!(
+        captured.target,
+        "/my-bucket?list-type=2&prefix=photos%2F2024%20summer%2F&delimiter=%2F"
+    );
+    assert!(
+        !captured.target.contains('+'),
+        "a space must be %20, never +: {}",
+        captured.target
+    );
+    assert!(captured.signature_valid);
+}
+
+/// A continuation token is base64, so it carries `+`, `/` and `=` - the three characters
+/// that would otherwise end the parameter early or turn into a different token.
+#[tokio::test]
+async fn a_continuation_token_reaches_the_wire_intact() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    server.push_reply(200, listing_xml());
+
+    client
+        .list_objects_v2(
+            "my-bucket",
+            my_s3::S3ListObjectsRequest {
+                continuation_token: Some("1ueGcxLPRx1Tr/XYExHnhbYLgveDs2J/wm36Hy4vbOwM="),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let captured = &server.captured()[0];
+
+    assert_eq!(
+        captured.target,
+        "/my-bucket?list-type=2&continuation-token=1ueGcxLPRx1Tr%2FXYExHnhbYLgveDs2J%2Fwm36Hy4vbOwM%3D"
+    );
+    assert!(captured.signature_valid);
+}
+
+/// A non-ASCII prefix has to be encoded over its UTF-8 bytes, because that is what the
+/// server re-encodes when it rebuilds the canonical query.
+#[tokio::test]
+async fn a_non_ascii_prefix_is_signed_as_its_utf8_bytes() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    server.push_reply(200, listing_xml());
+
+    client
+        .list_objects_v2(
+            "my-bucket",
+            my_s3::S3ListObjectsRequest {
+                prefix: Some("документы/"),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let captured = &server.captured()[0];
+
+    assert_eq!(
+        captured.target,
+        "/my-bucket?list-type=2&prefix=%D0%B4%D0%BE%D0%BA%D1%83%D0%BC%D0%B5%D0%BD%D1%82%D1%8B%2F"
+    );
+    assert!(captured.signature_valid);
+}
+
+#[tokio::test]
+async fn max_keys_is_sent_as_a_number() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    server.push_reply(200, listing_xml());
+
+    client
+        .list_objects_v2(
+            "my-bucket",
+            my_s3::S3ListObjectsRequest {
+                max_keys: Some(37),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        server.captured()[0].target,
+        "/my-bucket?list-type=2&max-keys=37"
+    );
+}
+
+/// End to end: the answer a real storage sends, read into the shape a caller uses.
+#[tokio::test]
+async fn list_objects_reads_the_page_the_storage_answered_with() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    server.push_reply(200, listing_xml());
+
+    let page = client
+        .list_objects_v2(
+            "my-bucket",
+            my_s3::S3ListObjectsRequest {
+                prefix: Some("photos/"),
+                delimiter: Some("/"),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(page.common_prefixes, ["photos/2024/"]);
+    assert_eq!(page.objects.len(), 1);
+    assert_eq!(page.objects[0].key, "photos/cover.jpg");
+    assert_eq!(page.objects[0].size, 1_048_576);
+    assert_eq!(page.next_continuation_token, None);
+}
+
+/// Walking the whole listing is a loop over the token, and the second request has to
+/// carry the first one's token *and* repeat the prefix and delimiter unchanged.
+#[tokio::test]
+async fn a_truncated_listing_is_resumed_with_the_token_it_handed_back() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    server.push_reply(
+        200,
+        r#"<ListBucketResult>
+  <IsTruncated>true</IsTruncated>
+  <NextContinuationToken>page/2=</NextContinuationToken>
+  <Contents><Key>photos/a.jpg</Key><LastModified>x</LastModified><Size>1</Size></Contents>
+</ListBucketResult>"#,
+    );
+    server.push_reply(
+        200,
+        r#"<ListBucketResult>
+  <IsTruncated>false</IsTruncated>
+  <Contents><Key>photos/b.jpg</Key><LastModified>x</LastModified><Size>2</Size></Contents>
+</ListBucketResult>"#,
+    );
+
+    let mut keys = Vec::new();
+    let mut token = None;
+
+    loop {
+        let page = client
+            .list_objects_v2(
+                "my-bucket",
+                my_s3::S3ListObjectsRequest {
+                    prefix: Some("photos/"),
+                    delimiter: Some("/"),
+                    continuation_token: token.as_deref(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        keys.extend(page.objects.into_iter().map(|object| object.key));
+
+        token = page.next_continuation_token;
+        if token.is_none() {
+            break;
+        }
+    }
+
+    assert_eq!(keys, ["photos/a.jpg", "photos/b.jpg"]);
+
+    let captured = server.captured();
+    assert_eq!(captured.len(), 2);
+    assert!(!captured[0].target.contains("continuation-token"));
+    assert_eq!(
+        captured[1].target,
+        "/my-bucket?list-type=2&prefix=photos%2F&delimiter=%2F&continuation-token=page%2F2%3D"
+    );
+    assert!(captured[1].signature_valid);
+}
+
+#[tokio::test]
+async fn listing_a_missing_bucket_is_typed() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    server.push_reply(
+        404,
+        "<Error><Code>NoSuchBucket</Code><Message>The specified bucket does not exist.</Message></Error>",
+    );
+
+    let err = client
+        .list_objects_v2("my-bucket", my_s3::S3ListObjectsRequest::default())
+        .await
+        .unwrap_err();
+
+    assert!(err.is_bucket_not_found());
+}
+
+/// A 200 whose body is not a listing at all - a proxy's page, say - must not read as an
+/// empty bucket. "There is nothing here" and "I could not tell" are different answers.
+#[tokio::test]
+async fn a_success_that_is_not_a_listing_is_not_an_empty_bucket() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    server.push_reply(200, "<html><body>Service Unavailable</body></html>");
+
+    assert!(
+        client
+            .list_objects_v2("my-bucket", my_s3::S3ListObjectsRequest::default())
+            .await
+            .is_err()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Streamed download
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_streamed_download_delivers_the_whole_object() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    server.push_reply(200, "the whole object, one chunk or several");
+
+    let mut stream = client
+        .download_file_as_stream("my-bucket", "a.bin")
+        .await
+        .unwrap();
+
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.get_next_chunk().await.unwrap() {
+        body.extend_from_slice(&chunk);
+    }
+
+    assert_eq!(body, b"the whole object, one chunk or several");
+    assert_eq!(stream.received(), body.len() as u64);
+
+    let captured = &server.captured()[0];
+    assert_eq!(captured.method, "GET");
+    assert_eq!(captured.target, "/my-bucket/a.bin");
+    assert!(captured.signature_valid);
+}
+
+/// Both are what forwarding the object over HTTP needs, and both have to be read off the
+/// response before the body is taken - the response is consumed by that.
+#[tokio::test]
+async fn a_streamed_download_carries_the_length_and_the_type() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    server.push_reply(200, "0123456789");
+
+    let stream = client
+        .download_file_as_stream("my-bucket", "a.bin")
+        .await
+        .unwrap();
+
+    assert_eq!(stream.content_length, Some(10));
+    assert_eq!(stream.content_type.as_deref(), Some("application/xml"));
+}
+
+/// A failure is still typed: the body of a non-2xx answer is the `<Error><Code>`, it is
+/// small, and it is read rather than streamed.
+#[tokio::test]
+async fn a_streamed_download_of_a_missing_key_is_typed() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    server.push_reply(404, no_such_key_xml());
+
+    let err = client
+        .download_file_as_stream("my-bucket", "missing.bin")
+        .await
+        .unwrap_err();
+
+    assert!(err.is_key_not_found());
+}
+
+/// **The one that matters for a file that gets written out.** The storage announced 64
+/// bytes, sent 9, and hung up. Reporting the end of the stream here would hand back a
+/// truncated file and call it a success.
+#[tokio::test]
+async fn a_body_that_ends_early_is_an_error_not_a_short_file() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    server.push_truncated_reply("truncated", 64);
+
+    let mut stream = client
+        .download_file_as_stream("my-bucket", "a.bin")
+        .await
+        .unwrap();
+
+    assert_eq!(stream.content_length, Some(64));
+
+    let mut received = Vec::new();
+    let outcome = loop {
+        match stream.get_next_chunk().await {
+            Ok(Some(chunk)) => received.extend_from_slice(&chunk),
+            Ok(None) => break Ok(()),
+            Err(err) => break Err(err),
+        }
+    };
+
+    // Which of the two guards fires is an implementation detail - the transport
+    // notices a body that stopped before `Content-Length` and reports a read error,
+    // and the byte count in `S3DownloadStream` is the backstop behind it. What must
+    // never happen is `Ok(None)`: that is the answer that writes out half a file and
+    // calls it a success.
+    let err = outcome.expect_err("a body that stopped short must not read as the end of one");
+
+    assert!(received.len() < 64, "got {} bytes", received.len());
+    // A cut connection is worth retrying; a 404 is not. The distinction has to survive.
+    assert!(err.is_retryable(), "{}", err);
+}
+
+/// A streamed download under tracing goes out as the same request - the trace must not
+/// reach for the body, which is the one thing it may not read here.
+#[tokio::test]
+async fn a_streamed_download_survives_debug_mode() {
+    let server = FakeS3::start().await;
+    let client = server.client().debug_to_console();
+
+    server.push_reply(200, "contents");
+
+    let mut stream = client
+        .download_file_as_stream("my-bucket", "a.bin")
+        .await
+        .unwrap();
+
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.get_next_chunk().await.unwrap() {
+        body.extend_from_slice(&chunk);
+    }
+
+    assert_eq!(body, b"contents");
+    assert!(server.captured()[0].signature_valid);
+}
+
+// ---------------------------------------------------------------------------
+// The harness itself
+// ---------------------------------------------------------------------------
+
+/// A test server that agrees with the client is worth nothing. This pins the one thing
+/// `FakeS3` has to get *independently* right: a real S3 rebuilds the canonical query by
+/// decoding and re-encoding it under RFC 3986, so a client that encoded its query the
+/// `x-www-form-urlencoded` way signs a different string from the one the server signs.
+///
+/// Without this, `fake_s3` took the query off the wire verbatim and would have called a
+/// `+`-for-space request correctly signed - the exact bug the client's encoder exists to
+/// avoid, validated by a server that shared it.
+#[test]
+fn the_fake_server_canonicalises_a_query_the_way_a_real_one_does() {
+    // A space sent as `+` is not the same canonical string as a space sent as `%20`,
+    // which is what makes the wrong encoding a 403 rather than a silent success.
+    assert_ne!(
+        fake_s3::canonical_query("prefix=a+b"),
+        fake_s3::canonical_query("prefix=a%20b")
+    );
+    assert_eq!(fake_s3::canonical_query("prefix=a+b"), "prefix=a%2Bb");
+    assert_eq!(fake_s3::canonical_query("prefix=a%20b"), "prefix=a%20b");
+
+    // `!` is not unreserved, so a client that left it literal signs a different string.
+    assert_eq!(fake_s3::canonical_query("k=a!b"), "k=a%21b");
+    // `~` is unreserved and must stay literal on both sides.
+    assert_eq!(fake_s3::canonical_query("k=a~b"), "k=a~b");
+
+    // Ordering is by encoded name, then encoded value; a valueless flag gets its `=`.
+    assert_eq!(fake_s3::canonical_query("b=2&a=1"), "a=1&b=2");
+    assert_eq!(fake_s3::canonical_query("location"), "location=");
+    assert_eq!(fake_s3::canonical_query(""), "");
+
+    // Re-encoding has to be idempotent for a correctly encoded query, or every one of
+    // our requests would fail.
+    let ours = "continuation-token=1ueGcxLPRx1Tr%2FXYExHnhbYLgveDs2J%2Fwm36Hy4vbOwM%3D\
+&delimiter=%2F&list-type=2&prefix=photos%2F2024%20summer%2F";
+    assert_eq!(fake_s3::canonical_query(ours), ours);
+}
