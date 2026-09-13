@@ -11,7 +11,14 @@ hmac = "0.13"
 sha2 = "0.11"
 hex = "0.4"
 
-flurl = { tag = "0.7.0", git = "https://github.com/MyJetTools/fl-url.git" }
+# `with-ring-tls` is not optional here: fl-url's `default = []` compiles the TLS
+# code paths out entirely, and S3 is always addressed over `https://`. Without a
+# provider feature every request dies at connect time with my-tls' "No rustls
+# CryptoProvider is installed". `with-rust-tls` is the pure-Rust alternative, but
+# it builds only on x86_64/aarch64 - ring is the one that works everywhere.
+flurl = { tag = "0.7.0", git = "https://github.com/MyJetTools/fl-url.git", features = [
+    "with-ring-tls",
+] }
 my-xml-reader = { tag = "0.1.1", git = "https://github.com/MyJetTools/my-xml-reader" }
 
 # `RequestBodyStream` lives here and `flurl` does not re-export it (only `hyper`,
