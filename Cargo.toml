@@ -11,13 +11,15 @@ hmac = "0.13"
 sha2 = "0.11"
 hex = "0.4"
 
-# `with-ring-tls` is not optional here: fl-url's `default = []` compiles the TLS
-# code paths out entirely, and S3 is always addressed over `https://`. Without a
-# provider feature every request dies at connect time with my-tls' "No rustls
-# CryptoProvider is installed". `with-rust-tls` is the pure-Rust alternative, but
-# it builds only on x86_64/aarch64 - ring is the one that works everywhere.
+# A TLS provider feature is not optional here: fl-url's `default = []` compiles the
+# TLS code paths out entirely, and S3 is always addressed over `https://`. Without
+# one every request dies at connect time with my-tls' "No rustls CryptoProvider is
+# installed". `with-rust-tls` backs rustls with rustls-graviola - pure Rust, no C
+# toolchain - at the cost of building ONLY on x86_64 and aarch64 (a hard
+# `compile_error!` anywhere else). Swap to `with-ring-tls` if another architecture
+# ever has to build this crate.
 flurl = { tag = "0.7.0", git = "https://github.com/MyJetTools/fl-url.git", features = [
-    "with-ring-tls",
+    "with-rust-tls",
 ] }
 my-xml-reader = { tag = "0.1.1", git = "https://github.com/MyJetTools/my-xml-reader" }
 
