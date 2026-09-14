@@ -1,11 +1,14 @@
+use std::future::Future;
 use std::time::Duration;
 
 use flurl::FlUrlResponse;
 use my_http_client::RequestBodyStream;
 use tokio::sync::mpsc::Receiver;
 
+use super::upload_writer::{DEFAULT_UPLOAD_CHUNK_SIZE, UploadWriterState};
 use super::{
     S3DownloadStream, S3Error, S3ListObjectsPage, S3ListObjectsRequest, S3Reader, S3Region,
+    S3UploadWriter,
 };
 
 /// `x-amz-content-sha256` value that tells S3 the payload is not covered by the
@@ -290,24 +293,165 @@ impl S3Client {
     where
         TNewBody: FnMut() -> Receiver<Vec<u8>>,
     {
-        let mut attempt = 0;
+        retry_while_retryable(max_retries, async || {
+            self.upload_streamed(bucket_name, key, new_body(), content_length, upload_timeout)
+                .await
+        })
+        .await
+    }
 
-        loop {
-            let result = self
-                .upload_streamed(bucket_name, key, new_body(), content_length, upload_timeout)
-                .await;
+    /// [`Self::upload_streamed`] with the body written through a
+    /// `tokio::io::AsyncWrite` instead of pushed into a channel.
+    ///
+    /// This is the mirror of [`Self::open_reader`]. A producer shaped like
+    /// `write_to(&mut impl AsyncWrite)` - anything already written against
+    /// `tokio::fs::File` - writes an S3 object with no adapter on its side, and the
+    /// object is never held in memory. Underneath it is exactly
+    /// [`Self::upload_streamed`]: [`S3UploadWriter`] fills a chunk, the chunk goes into
+    /// the same bounded channel, and the same request sends it.
+    ///
+    /// `produce` is given the writer to own and is run **concurrently** with the
+    /// upload - it has to be, since the channel is bounded and the upload is what
+    /// drains it. This call returns only once both have finished.
+    ///
+    /// `content_length` must be exact, for the reasons
+    /// [`Self::upload_streamed`] spells out. Here the writer also enforces it: a byte
+    /// past it is refused with [`std::io::ErrorKind::InvalidInput`] rather than sent.
+    ///
+    /// # The producer must `shutdown` the writer
+    ///
+    /// `tokio::io::AsyncWriteExt::shutdown` sends the last partial chunk and ends the
+    /// body. A producer that just returns leaves that chunk unsent.
+    ///
+    /// # Which error comes back
+    ///
+    /// When an upload goes wrong, both halves fail - and they report different things,
+    /// so which one surfaces matters:
+    ///
+    /// - **The producer failed on its own** (its file vanished, it ran past
+    ///   `content_length`): [`S3Error::UploadProducerFailed`], carrying its
+    ///   `io::Error`. Never the storage's complaint about a short body, which is only
+    ///   the consequence. It is not retryable - the source is what has to change.
+    /// - **The upload failed while the producer was still writing**: the producer sees
+    ///   [`std::io::ErrorKind::BrokenPipe`] and stops, and the error returned here is
+    ///   the **S3 one** that says why. Ask [`S3Error::is_retryable`] as usual.
+    /// - **The producer returned `Ok` having written less than `content_length`**: an
+    ///   error, never a success - [`S3Error::UploadProducerFailed`] with
+    ///   [`std::io::ErrorKind::UnexpectedEof`]. Usually a missing `shutdown`.
+    ///
+    /// ```no_run
+    /// # async fn doc(s3: &my_s3::S3Client, path: &'static str) -> Result<(), my_s3::S3Error> {
+    /// use tokio::io::AsyncWriteExt;
+    ///
+    /// let length = tokio::fs::metadata(path).await.unwrap().len() as usize;
+    ///
+    /// s3.upload_with_writer(
+    ///     "my-bucket",
+    ///     "archives/backup.tar",
+    ///     length,
+    ///     std::time::Duration::from_secs(600),
+    ///     |mut writer| async move {
+    ///         let mut file = tokio::fs::File::open(path).await?;
+    ///         tokio::io::copy(&mut file, &mut writer).await?;
+    ///         writer.shutdown().await
+    ///     },
+    /// )
+    /// .await
+    /// # }
+    /// ```
+    pub async fn upload_with_writer<TProduce, TFuture>(
+        &self,
+        bucket_name: &str,
+        key: &str,
+        content_length: usize,
+        upload_timeout: Duration,
+        produce: TProduce,
+    ) -> Result<(), S3Error>
+    where
+        TProduce: FnOnce(S3UploadWriter) -> TFuture,
+        TFuture: Future<Output = std::io::Result<()>> + Send + 'static,
+    {
+        let (writer, body, state) =
+            S3UploadWriter::new(bucket_name, key, content_length, DEFAULT_UPLOAD_CHUNK_SIZE);
 
-            let err = match result {
-                Ok(()) => return Ok(()),
-                Err(err) => err,
-            };
+        // Spawned rather than joined so that the producer keeps being driven after the
+        // upload future has resolved and dropped the `Receiver`. That drop is what turns
+        // a dead upload into the `BrokenPipe` the producer needs to see in order to
+        // finish at all - a producer parked on a full channel would otherwise never be
+        // woken, and this call would never return.
+        let producing = tokio::spawn(produce(writer));
 
-            if attempt >= max_retries || !err.is_retryable() {
-                return Err(err);
-            }
+        let upload_result = self
+            .upload_streamed(bucket_name, key, body, content_length, upload_timeout)
+            .await;
 
-            attempt += 1;
-        }
+        // Always awaited, including when the upload already failed: the producer owns
+        // the caller's source and must be finished with it before this returns.
+        let produce_result = producing.await;
+
+        finish_upload_with_writer(upload_result, produce_result, &state, content_length)
+    }
+
+    /// [`Self::upload_with_writer`] with the retry loop, on the same terms as
+    /// [`Self::upload_streamed_with_retries`].
+    ///
+    /// `produce` is called **once per attempt**, with a fresh [`S3UploadWriter`] each
+    /// time, and must write the body **from the beginning** every time - reopen the
+    /// file, re-run the query. A streamed body is consumed as it is sent, so there is
+    /// nothing to resume from; a producer that carried on where it left off would send
+    /// the second attempt short.
+    ///
+    /// Only [`S3Error::is_retryable`] failures are repeated, so a failure of the
+    /// *producer* ends it immediately: repeating it would ask the same source for the
+    /// same bytes and get the same answer.
+    ///
+    /// ```no_run
+    /// # async fn doc(s3: &my_s3::S3Client, path: &'static str, length: usize)
+    /// # -> Result<(), my_s3::S3Error> {
+    /// use tokio::io::AsyncWriteExt;
+    ///
+    /// s3.upload_with_writer_with_retries(
+    ///     "my-bucket",
+    ///     "archives/backup.tar",
+    ///     length,
+    ///     std::time::Duration::from_secs(600),
+    ///     3,
+    ///     |mut writer| async move {
+    ///         // A fresh handle per attempt, positioned at the start.
+    ///         let mut file = tokio::fs::File::open(path).await?;
+    ///         tokio::io::copy(&mut file, &mut writer).await?;
+    ///         writer.shutdown().await
+    ///     },
+    /// )
+    /// .await
+    /// # }
+    /// ```
+    pub async fn upload_with_writer_with_retries<TProduce, TFuture>(
+        &self,
+        bucket_name: &str,
+        key: &str,
+        content_length: usize,
+        upload_timeout: Duration,
+        max_retries: usize,
+        mut produce: TProduce,
+    ) -> Result<(), S3Error>
+    where
+        TProduce: FnMut(S3UploadWriter) -> TFuture,
+        TFuture: Future<Output = std::io::Result<()>> + Send + 'static,
+    {
+        retry_while_retryable(max_retries, async || {
+            // `&mut TProduce` is itself `FnOnce`, which is what lets one attempt take
+            // the closure by value without the loop losing it.
+            self.upload_with_writer(
+                bucket_name,
+                key,
+                content_length,
+                upload_timeout,
+                &mut produce,
+            )
+            .await
+        })
+        .await
     }
 
     pub async fn download_file(&self, bucket_name: &str, key: &str) -> Result<Vec<u8>, S3Error> {
@@ -909,6 +1053,101 @@ impl S3Client {
         }
 
         println!("{}", format_response_trace(status_code, body));
+    }
+}
+
+/// The attempt loop both retrying uploads share.
+///
+/// It lives here rather than being written twice because the rule is subtle and must not
+/// drift: `max_retries` counts *retries*, so `max_retries + 1` attempts are made; a
+/// failure that [`S3Error::is_retryable`] rejects ends it at once, however many attempts
+/// are left; and the error returned is the last one, not the first.
+async fn retry_while_retryable<TAttempt>(
+    max_retries: usize,
+    mut attempt: TAttempt,
+) -> Result<(), S3Error>
+where
+    TAttempt: AsyncFnMut() -> Result<(), S3Error>,
+{
+    let mut retries = 0;
+
+    loop {
+        let err = match attempt().await {
+            Ok(()) => return Ok(()),
+            Err(err) => err,
+        };
+
+        if retries >= max_retries || !err.is_retryable() {
+            return Err(err);
+        }
+
+        retries += 1;
+    }
+}
+
+/// Decides which of two failures the caller of [`S3Client::upload_with_writer`] sees.
+///
+/// An upload written through a writer has two halves that fail *together*: kill either
+/// one and the other stops right after, with an error that describes the wreckage rather
+/// than the cause. So the rule is about order, not about which error looks worse:
+///
+/// > If the writer saw the channel close under it, the upload died first and everything
+/// > the producer reports is downstream of that - the S3 error is the one that explains
+/// > the failure. Otherwise the producer failed on its own, and the S3 error is only
+/// > "the body was shorter than `Content-Length`", which explains nothing.
+///
+/// A producer that returns `Ok` having delivered less than it declared is a failure of
+/// the same kind, and is caught here rather than left to the storage: the storage would
+/// report it as a malformed request, or - with an unlucky server - not at all.
+fn finish_upload_with_writer(
+    upload_result: Result<(), S3Error>,
+    produce_result: Result<std::io::Result<()>, tokio::task::JoinError>,
+    state: &UploadWriterState,
+    content_length: usize,
+) -> Result<(), S3Error> {
+    let producer_failure = match produce_result {
+        // A panic (or a cancelled task) is never a success, and the panic message has
+        // already gone to stderr where a panic belongs.
+        Err(join_error) => Some(std::io::Error::other(format!(
+            "the upload body producer did not finish: {}",
+            join_error
+        ))),
+
+        Ok(Err(err)) => Some(err),
+
+        Ok(Ok(())) => {
+            let delivered = state.accepted();
+
+            if delivered < content_length as u64 {
+                Some(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "the upload body producer reported success after writing {} of the {} bytes it declared - a missing shutdown() leaves the last chunk unsent",
+                        delivered, content_length
+                    ),
+                ))
+            } else {
+                None
+            }
+        }
+    };
+
+    match (upload_result, producer_failure) {
+        (Ok(()), None) => Ok(()),
+
+        // The storage accepted a body the producer did not finish. Whether a server can
+        // actually answer this way or not, it is not something to return as success.
+        (Ok(()), Some(err)) => Err(S3Error::UploadProducerFailed(err)),
+
+        (Err(err), None) => Err(err),
+
+        (Err(s3_error), Some(producer_error)) => {
+            if state.upload_ended() {
+                Err(s3_error)
+            } else {
+                Err(S3Error::UploadProducerFailed(producer_error))
+            }
+        }
     }
 }
 

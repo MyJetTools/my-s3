@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use fake_s3::FakeS3;
 use sha2::Digest;
+use tokio::io::AsyncWriteExt;
 
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -321,6 +322,408 @@ async fn retries_give_up_and_return_the_last_error() {
     assert!(err.is_retryable());
     // 1 initial attempt + 2 retries
     assert_eq!(server.request_count(), 3);
+}
+
+// ---------------------------------------------------------------------------
+// Uploading through an AsyncWrite
+// ---------------------------------------------------------------------------
+
+/// Content with no repeating period, so a chunk that arrived twice or in the wrong
+/// order cannot compare equal by luck.
+fn pattern(length: usize) -> Vec<u8> {
+    (0..length).map(|index| (index % 251) as u8).collect()
+}
+
+/// A writer is only useful to a producer that can move it onto another task, which is
+/// exactly what `upload_with_writer` does to it. `Unpin` is what lets `write_all` and
+/// `tokio::io::copy` take it by `&mut` without pinning it first.
+#[test]
+fn the_writer_is_send_and_unpin() {
+    fn assert_send_and_unpin<T: Send + Unpin>() {}
+
+    assert_send_and_unpin::<my_s3::S3UploadWriter>();
+}
+
+/// The pathological producer: one byte per call, so every path through `poll_write` is
+/// taken thousands of times and the final partial chunk is the only thing `shutdown`
+/// has to send.
+#[tokio::test]
+async fn writer_upload_delivers_the_object_written_one_byte_at_a_time() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    let content = pattern(3_000);
+    let expected = content.clone();
+
+    client
+        .upload_with_writer(
+            "my-bucket",
+            "archives/tiny.bin",
+            content.len(),
+            UPLOAD_TIMEOUT,
+            |mut writer| async move {
+                for byte in &content {
+                    writer.write_all(&[*byte]).await?;
+                }
+                writer.shutdown().await
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        server.uploaded_object("my-bucket", "archives/tiny.bin"),
+        Some(expected)
+    );
+}
+
+/// Writes smaller than the chunk size, over a body several chunks long: the interesting
+/// part is the boundaries, where a write is split between the chunk being sent and the
+/// one being started.
+#[tokio::test]
+async fn writer_upload_delivers_the_object_written_in_small_pieces() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    // Deliberately not a multiple of the 512 KiB chunk size, nor of the write size.
+    let content = pattern(1_500_000);
+    let expected = content.clone();
+
+    client
+        .upload_with_writer(
+            "my-bucket",
+            "archives/pieces.bin",
+            content.len(),
+            UPLOAD_TIMEOUT,
+            |mut writer| async move {
+                for piece in content.chunks(7_000) {
+                    writer.write_all(piece).await?;
+                }
+                writer.shutdown().await
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        server.uploaded_object("my-bucket", "archives/pieces.bin"),
+        Some(expected)
+    );
+}
+
+/// One write far larger than a chunk. `poll_write` answers it with a partial write per
+/// chunk, so this is really a test that `write_all` and the writer agree about how many
+/// bytes were taken - an off-by-one there duplicates or drops a chunk's worth.
+#[tokio::test]
+async fn writer_upload_delivers_the_object_written_in_one_multi_megabyte_write() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    let content = pattern(3 * 1024 * 1024);
+    let expected = content.clone();
+
+    client
+        .upload_with_writer(
+            "my-bucket",
+            "archives/one-write.bin",
+            content.len(),
+            UPLOAD_TIMEOUT,
+            |mut writer| async move {
+                writer.write_all(&content).await?;
+                writer.shutdown().await
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        server.uploaded_object("my-bucket", "archives/one-write.bin"),
+        Some(expected)
+    );
+}
+
+/// The shape the README advertises, and the reason this exists at all: a producer that
+/// only knows how to write into an `AsyncWrite`, copied in with no adapter.
+#[tokio::test]
+async fn writer_upload_works_as_the_destination_of_tokio_io_copy() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    let content = pattern(900_000);
+    let expected = content.clone();
+
+    client
+        .upload_with_writer(
+            "my-bucket",
+            "archives/copied.bin",
+            content.len(),
+            UPLOAD_TIMEOUT,
+            |mut writer| async move {
+                let mut source = std::io::Cursor::new(content);
+                tokio::io::copy(&mut source, &mut writer).await?;
+                writer.shutdown().await
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        server.uploaded_object("my-bucket", "archives/copied.bin"),
+        Some(expected)
+    );
+}
+
+/// `Content-Length` was signed before the first byte existed and cannot be corrected, so
+/// the byte that would go past it is refused rather than sent. The object must not
+/// exist: half of an archive is worse than none of one.
+#[tokio::test]
+async fn writing_past_content_length_is_refused_and_nothing_is_stored() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    let err = client
+        .upload_with_writer(
+            "my-bucket",
+            "archives/over.bin",
+            1_000,
+            UPLOAD_TIMEOUT,
+            |mut writer| async move {
+                // The producer has miscounted: it declared 1 000 and has 1 500.
+                writer.write_all(&pattern(1_500)).await?;
+                writer.shutdown().await
+            },
+        )
+        .await
+        .unwrap_err();
+
+    let io_error = err
+        .get_upload_producer_error()
+        .expect("a producer that ran past its length is the producer's failure");
+
+    assert_eq!(io_error.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(!err.is_retryable(), "writing too much cannot be retried");
+
+    assert_eq!(
+        server.uploaded_object("my-bucket", "archives/over.bin"),
+        None
+    );
+}
+
+/// A producer that returns `Ok` without having written everything - the missing
+/// `shutdown`, or a loop that ended a chunk early. The storage's own complaint about a
+/// short body is not enough: it says the request was malformed, not that the caller
+/// stopped early.
+#[tokio::test]
+async fn a_producer_that_stops_short_is_never_a_success() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    let err = client
+        .upload_with_writer(
+            "my-bucket",
+            "archives/short.bin",
+            1_000,
+            UPLOAD_TIMEOUT,
+            |mut writer| async move {
+                writer.write_all(&pattern(400)).await?;
+                writer.shutdown().await
+            },
+        )
+        .await
+        .unwrap_err();
+
+    let io_error = err
+        .get_upload_producer_error()
+        .expect("a body that stopped early is the producer's failure");
+
+    assert_eq!(io_error.kind(), std::io::ErrorKind::UnexpectedEof);
+    assert!(
+        io_error.to_string().contains("400 of the 1000"),
+        "the error has to say how far it got, got: {}",
+        io_error
+    );
+
+    assert_eq!(
+        server.uploaded_object("my-bucket", "archives/short.bin"),
+        None
+    );
+}
+
+/// The producer's own error is the one that comes back - not the short-body error it
+/// causes downstream - and it is not repeated: asking the same broken source again gets
+/// the same answer.
+#[tokio::test]
+async fn a_producer_that_fails_surfaces_its_own_error_and_is_not_retried() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = calls.clone();
+
+    let err = client
+        .upload_with_writer_with_retries(
+            "my-bucket",
+            "archives/broken.bin",
+            1_000,
+            UPLOAD_TIMEOUT,
+            3,
+            move |mut writer| {
+                let calls = counted.clone();
+                async move {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    writer.write_all(&pattern(100)).await?;
+
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "the archive source gave up",
+                    ))
+                }
+            },
+        )
+        .await
+        .unwrap_err();
+
+    let io_error = err
+        .get_upload_producer_error()
+        .expect("the producer's error, not the storage's");
+
+    assert_eq!(io_error.kind(), std::io::ErrorKind::PermissionDenied);
+    assert_eq!(io_error.to_string(), "the archive source gave up");
+
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::Acquire),
+        1,
+        "a broken source must not be asked again"
+    );
+    assert_eq!(
+        server.uploaded_object("my-bucket", "archives/broken.bin"),
+        None
+    );
+}
+
+/// A streamed body is consumed as it is sent, so a retry is a whole new body. The
+/// producer is called again with a fresh writer and has to write from the beginning -
+/// one that resumed would send the second attempt short.
+#[tokio::test]
+async fn a_retryable_failure_re_runs_the_producer_from_the_beginning() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    server.push_reply(
+        503,
+        "<Error><Code>ServiceUnavailable</Code><Message>later</Message></Error>",
+    );
+
+    let content = pattern(300_000);
+    let expected = content.clone();
+
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = calls.clone();
+
+    client
+        .upload_with_writer_with_retries(
+            "my-bucket",
+            "archives/retried.bin",
+            content.len(),
+            UPLOAD_TIMEOUT,
+            3,
+            move |mut writer| {
+                let calls = counted.clone();
+                let content = content.clone();
+                async move {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    writer.write_all(&content).await?;
+                    writer.shutdown().await
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::Acquire),
+        2,
+        "one failed attempt and one that worked"
+    );
+
+    let captured = server.captured();
+    assert_eq!(captured.len(), 2);
+
+    // Both attempts carried the whole payload: the second one is what proves the
+    // producer restarted rather than resumed.
+    for attempt in &captured {
+        assert_eq!(attempt.body.len(), expected.len());
+        assert_eq!(attempt.body, expected);
+        assert!(attempt.body_complete);
+    }
+
+    assert_eq!(
+        server.uploaded_object("my-bucket", "archives/retried.bin"),
+        Some(expected)
+    );
+}
+
+/// The upload dies while the producer is still writing. The producer has to find out -
+/// otherwise it sits on a channel nobody drains and this call never returns - but what
+/// it finds out is only `BrokenPipe`, which says nothing. The error that surfaces must
+/// be the storage's, which says why.
+#[tokio::test]
+async fn an_upload_that_dies_mid_body_gives_the_producer_broken_pipe() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    // Far more than any socket buffer will absorb, so the client is still writing when
+    // the server hangs up 64 KiB in.
+    let length = 32 * 1024 * 1024;
+    server.abort_next_request_after(64 * 1024);
+
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let reported = seen.clone();
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(30),
+        client.upload_with_writer(
+            "my-bucket",
+            "archives/cut.bin",
+            length,
+            UPLOAD_TIMEOUT,
+            move |mut writer| async move {
+                let piece = vec![9u8; 64 * 1024];
+                let mut written = 0;
+
+                while written < length {
+                    if let Err(err) = writer.write_all(&piece).await {
+                        *reported.lock().unwrap() = Some(err.kind());
+                        return Err(err);
+                    }
+                    written += piece.len();
+                }
+
+                writer.shutdown().await
+            },
+        ),
+    )
+    .await
+    .expect("the producer has to be woken when the upload dies, or this never returns");
+
+    let err = result.unwrap_err();
+
+    assert_eq!(
+        *seen.lock().unwrap(),
+        Some(std::io::ErrorKind::BrokenPipe),
+        "the producer has to see the upload go away"
+    );
+
+    assert!(
+        !err.is_upload_producer_failed(),
+        "the upload died first, so its own error is the one that explains this - got: {}",
+        err
+    );
+
+    assert_eq!(
+        server.uploaded_object("my-bucket", "archives/cut.bin"),
+        None
+    );
 }
 
 // ---------------------------------------------------------------------------

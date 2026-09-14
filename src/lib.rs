@@ -12,3 +12,5 @@ mod download_stream;
 pub use download_stream::*;
 mod reader;
 pub use reader::*;
+mod upload_writer;
+pub use upload_writer::*;

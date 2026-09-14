@@ -32,6 +32,14 @@ pub enum S3Error {
         error_code: Option<String>,
         body: String,
     },
+    /// The producer handed to [`crate::S3Client::upload_with_writer`] failed before it
+    /// had written the whole body.
+    ///
+    /// This is the *source's* failure, not the storage's - a file that could not be
+    /// read, a serializer that gave up - and it is reported in preference to the S3
+    /// error it causes, which is only ever "the body was shorter than `Content-Length`"
+    /// and says nothing about why.
+    UploadProducerFailed(std::io::Error),
     Other(String),
 }
 
@@ -71,6 +79,20 @@ impl S3Error {
 
     pub fn is_range_not_satisfiable(&self) -> bool {
         matches!(self, Self::RangeNotSatisfiable)
+    }
+
+    pub fn is_upload_producer_failed(&self) -> bool {
+        matches!(self, Self::UploadProducerFailed(_))
+    }
+
+    /// The producer's own `io::Error`, for a caller that wants to match on its
+    /// [`std::io::ErrorKind`] - `InvalidInput` for a body that ran past
+    /// `Content-Length`, `UnexpectedEof` for one that stopped short.
+    pub fn get_upload_producer_error(&self) -> Option<&std::io::Error> {
+        match self {
+            Self::UploadProducerFailed(err) => Some(err),
+            _ => None,
+        }
     }
 
     pub fn get_status_code(&self) -> Option<u16> {
@@ -131,6 +153,12 @@ impl S3Error {
             | Self::EntityTooSmall
             | Self::RangeNotSatisfiable => false,
 
+            // The body could not be produced. Repeating the request would ask the same
+            // source for the same bytes and fail the same way; what has to change is
+            // local, so the retry - if any - is the caller's to decide, not this
+            // crate's to take automatically.
+            Self::UploadProducerFailed(_) => false,
+
             Self::Other(_) => false,
         }
     }
@@ -178,12 +206,25 @@ impl std::fmt::Display for S3Error {
             Self::UnexpectedStatusCode {
                 status_code, body, ..
             } => write!(f, "Status Code: {}. Err: {}", status_code, body),
+            Self::UploadProducerFailed(err) => {
+                write!(f, "The upload body could not be produced: {}", err)
+            }
             Self::Other(msg) => write!(f, "{}", msg),
         }
     }
 }
 
-impl std::error::Error for S3Error {}
+impl std::error::Error for S3Error {
+    /// Only [`S3Error::UploadProducerFailed`] has one: the producer's `io::Error` is a
+    /// real error of its own, often wrapping the caller's, and `?` in an
+    /// `io::Error`-shaped caller should be able to walk back to it.
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::UploadProducerFailed(err) => Some(err),
+            _ => None,
+        }
+    }
+}
 
 impl From<FlUrlError> for S3Error {
     fn from(value: FlUrlError) -> Self {

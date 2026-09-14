@@ -32,6 +32,10 @@ pub struct Captured {
     pub target: String,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+    /// Whether all of the `Content-Length` bytes actually arrived. `false` is what a
+    /// body that stopped early looks like from here - the producer gave up, or the
+    /// connection went away mid-request.
+    pub body_complete: bool,
     /// Whether the `Authorization` header verifies against the body and headers as
     /// received.
     pub signature_valid: bool,
@@ -74,6 +78,19 @@ struct State {
     /// How long to sit on every answer before writing it, so a test can observe a
     /// request that is genuinely still in flight rather than racing the loopback.
     delay: Mutex<Option<Duration>>,
+    /// Bodies of the `PUT`s that arrived **whole** and were answered with a 2xx, keyed
+    /// by request path.
+    ///
+    /// Separate from [`State::objects`], which is what tests *seed* for reading: an
+    /// upload that lands here is a fact about what the client sent, and mixing the two
+    /// would turn "this test uploaded something" into "every later GET 404s".
+    uploaded: Mutex<HashMap<String, Vec<u8>>>,
+    /// Bytes to accept of the next request body before hanging up, mid-request.
+    ///
+    /// This is the one failure a streamed upload cannot be shown any other way: the
+    /// request dies while the client is still writing it, so the producer finds out
+    /// through its writer rather than through the upload's return value.
+    abort_after: Mutex<Option<usize>>,
 }
 
 pub struct FakeS3 {
@@ -91,6 +108,8 @@ impl FakeS3 {
             captured: Mutex::new(Vec::new()),
             objects: Mutex::new(HashMap::new()),
             delay: Mutex::new(None),
+            uploaded: Mutex::new(HashMap::new()),
+            abort_after: Mutex::new(None),
         });
 
         let accept_state = state.clone();
@@ -157,6 +176,31 @@ impl FakeS3 {
     /// `Duration::ZERO` turns it off again.
     pub fn delay_every_reply(&self, delay: Duration) {
         *self.state.delay.lock().unwrap() = if delay.is_zero() { None } else { Some(delay) };
+    }
+
+    /// The body of the `PUT` that stored `key`, if one arrived whole and was accepted.
+    ///
+    /// `None` is the assertion "the object was never written": a request that was
+    /// refused, cut short, or never made all read the same way to a consumer, and all
+    /// three must.
+    pub fn uploaded_object(&self, bucket_name: &str, key: &str) -> Option<Vec<u8>> {
+        self.state
+            .uploaded
+            .lock()
+            .unwrap()
+            .get(&format!("/{}/{}", bucket_name, key))
+            .cloned()
+    }
+
+    /// Makes the **next** request die after `after_bytes` of its body have been read:
+    /// the connection is dropped where it stands, with no answer.
+    ///
+    /// That is an upload the network killed halfway, which is the only way to observe a
+    /// producer that is still writing when the upload is already over. Use a body large
+    /// enough that the client cannot have written all of it into the socket buffers
+    /// before this fires.
+    pub fn abort_next_request_after(&self, after_bytes: usize) {
+        *self.state.abort_after.lock().unwrap() = Some(after_bytes);
     }
 
     pub fn captured(&self) -> Vec<Captured> {
@@ -228,10 +272,19 @@ async fn serve_connection(
 
         buffer.drain(..header_end + 4);
 
-        let body = if is_chunked {
+        // Armed once, consumed once: a retry test arms it for the first attempt and the
+        // second attempt must be served normally.
+        let abort_after = state.abort_after.lock().unwrap().take();
+
+        let body: Vec<u8> = if is_chunked {
             read_chunked_body(&mut stream, &mut buffer).await?
         } else {
-            while buffer.len() < content_length {
+            let wanted = match abort_after {
+                Some(after_bytes) => content_length.min(after_bytes),
+                None => content_length,
+            };
+
+            while buffer.len() < wanted {
                 let mut chunk = [0u8; 8192];
                 let read = stream.read(&mut chunk).await?;
                 if read == 0 {
@@ -239,9 +292,11 @@ async fn serve_connection(
                 }
                 buffer.extend_from_slice(&chunk[..read]);
             }
-            let taken = buffer.len().min(content_length);
+            let taken = buffer.len().min(wanted);
             buffer.drain(..taken).collect()
         };
+
+        let body_complete = is_chunked || body.len() == content_length;
 
         let signature_valid = verify_signature(&method, &target, &headers, &body);
 
@@ -257,9 +312,16 @@ async fn serve_connection(
             method: method.clone(),
             target: target.clone(),
             headers,
-            body,
+            body: body.clone(),
+            body_complete,
             signature_valid,
         });
+
+        // Dropping the stream here is the hang-up: no status line, no answer, in the
+        // middle of a request the client is still writing.
+        if abort_after.is_some() {
+            return Ok(());
+        }
 
         // A queued reply first: a test that injected one is testing that answer, even
         // for a path this server holds an object for.
@@ -270,6 +332,21 @@ async fn serve_connection(
             None => serve_from_objects(&state, &method, &target, range.as_deref())
                 .unwrap_or_else(Response::empty_ok),
         };
+
+        // What the storage now holds. Only a `PUT` that arrived whole and was answered
+        // with a 2xx wrote anything - a 503 means the object is exactly as it was.
+        if method.eq_ignore_ascii_case("PUT") && body_complete && is_success(response.status_code) {
+            let path = match target.split_once('?') {
+                Some((path, _)) => path,
+                None => target.as_str(),
+            };
+
+            state
+                .uploaded
+                .lock()
+                .unwrap()
+                .insert(path.to_string(), body);
+        }
 
         let lied_about_length = response.lie_about_length.is_some();
 
@@ -737,6 +814,10 @@ fn derive_signing_key(secret_key: &str, date: &str, region: &str, service: &str)
     }
 
     key
+}
+
+fn is_success(status_code: u16) -> bool {
+    (200..300).contains(&status_code)
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {

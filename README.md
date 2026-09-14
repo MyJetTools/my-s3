@@ -7,9 +7,9 @@ between calls.
 
 It covers what a service actually does with object storage: put an object, get it back,
 delete it, list a bucket, and make sure the bucket is there. Objects larger than memory
-have a streaming path in both directions, and an object can also be read as a seekable
-source — `AsyncRead + AsyncSeek`, so code written against `tokio::fs::File` works
-unchanged. It is deliberately not an SDK — there is no versioning, no ACLs, no lifecycle,
+have a streaming path in both directions, and an object can be read as a seekable source
+or written as a sink — `AsyncRead + AsyncSeek` one way, `AsyncWrite` the other — so code
+written against `tokio::fs::File` works unchanged. It is deliberately not an SDK — there is no versioning, no ACLs, no lifecycle,
 no presigning.
 
 ## Adding it
@@ -125,6 +125,10 @@ Three things the compiler will not tell you:
 Retrying an upload is safe: `PutObject` replaces the whole object atomically, so a failed
 attempt leaves either the previous object or nothing, never half of one.
 
+If the producer is code that writes into a `tokio::io::AsyncWrite` rather than into a
+channel — most things that already know how to write a file — use `upload_with_writer`
+instead; see [Writing an object like a file](#writing-an-object-like-a-file).
+
 A streamed body is signed as `UNSIGNED-PAYLOAD` — the signature covers the verb, path and
 headers, but not the body, whose hash is not knowable before the body exists. Integrity
 therefore rests on TLS, so use an `https` endpoint. AWS and Ceph both accept this.
@@ -232,6 +236,68 @@ if let Some(err) = err.get_ref().and_then(|err| err.downcast_ref::<my_s3::S3Erro
 `KeyNotFound` is the one that is mapped rather than wrapped: it becomes
 `io::ErrorKind::NotFound`, the same answer a missing file gives.
 
+## Writing an object like a file
+
+`upload_with_writer` is `open_reader` the other way round. It hands a producer an
+`S3UploadWriter` — a `tokio::io::AsyncWrite` — so code that already knows how to write a
+file writes an S3 object with no adapter, and the object is never held in memory.
+
+```rust
+use tokio::io::AsyncWriteExt;
+
+let length = tokio::fs::metadata(path).await?.len() as usize;
+
+s3.upload_with_writer(
+    "my-bucket",
+    "backup.tar",
+    length,
+    Duration::from_secs(600),
+    |mut writer| async move {
+        let mut file = tokio::fs::File::open(path).await?;
+        tokio::io::copy(&mut file, &mut writer).await?;
+        writer.shutdown().await          // sends the last chunk and ends the body
+    },
+)
+.await?;
+```
+
+Anything shaped like `write_to(&mut impl AsyncWrite)` drops straight in — the producer
+never learns it is talking to S3.
+
+Underneath it *is* `upload_streamed`: the writer fills a 512 KiB chunk, the chunk goes
+into the same bounded channel, and the same single request sends it. The producer runs
+concurrently with the upload — it has to, since the channel is bounded and the upload is
+what drains it — and the call returns only once both have finished. Peak memory is the
+chunk being filled plus the four the channel holds, about 2.5 MiB, whatever the size of
+the object.
+
+- **`content_length` must be exact**, for the same reason as in `upload_streamed`. Here
+  the writer enforces it too: the byte that would go past it is refused with
+  `io::ErrorKind::InvalidInput` and never sent, rather than quietly dropped.
+- **`shutdown` is not optional.** It is what sends the last partial chunk and ends the
+  body. A producer that just returns has written less than it declared.
+- **Retries re-run the producer**, with a fresh writer, from the beginning —
+  `upload_with_writer_with_retries` runs that loop on the same terms as
+  `upload_streamed_with_retries`. A streamed body is consumed as it is sent, so there is
+  nothing to resume from.
+
+When something goes wrong both halves fail, and they say different things, so which one
+comes back matters:
+
+| What happened | What you get |
+| --- | --- |
+| The producer failed on its own | `S3Error::UploadProducerFailed` with its `io::Error` — never the storage's complaint about a short body, which is only the consequence. Not retryable: the source is what has to change. |
+| The upload died while the producer was still writing | The **S3 error** that says why. The producer sees `io::ErrorKind::BrokenPipe`, which is how it finds out to stop, but `BrokenPipe` explains nothing and is not what surfaces. |
+| The producer returned `Ok` having written too little | `S3Error::UploadProducerFailed` with `io::ErrorKind::UnexpectedEof`, never a success. Usually a missing `shutdown`. |
+
+```rust
+if let Some(err) = err.get_upload_producer_error() {
+    // our side: a file that vanished, a length that was wrong
+} else if err.is_retryable() {
+    // the storage's side, and worth another attempt
+}
+```
+
 ## Listing a bucket
 
 ```rust
@@ -312,7 +378,13 @@ match s3.download_file("my-bucket", "maybe.json").await {
 
 Predicates: `is_key_not_found`, `is_bucket_not_found`, `is_bucket_already_exists`,
 `is_bucket_already_owned_by_you`, `bucket_name_is_taken` (either of the last two),
-`is_no_such_upload`, `is_entity_too_small`, `is_range_not_satisfiable`.
+`is_no_such_upload`, `is_entity_too_small`, `is_range_not_satisfiable`,
+`is_upload_producer_failed`.
+
+One variant is not the storage's answer at all: `UploadProducerFailed` is *our* side of
+an `upload_with_writer` — the body could not be produced. `get_upload_producer_error()`
+hands back the `io::Error` that says why, and it is never retryable, because what has to
+change is local.
 
 `get_status_code()` gives the number for an unmapped answer, and `is_retryable()` answers
 whether repeating the same request could plausibly succeed: 5xx, 429, a transport

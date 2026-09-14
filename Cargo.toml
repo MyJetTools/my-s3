@@ -29,7 +29,11 @@ my-xml-reader = { tag = "0.1.1", git = "https://github.com/MyJetTools/my-xml-rea
 # `put_request_streamed` stops accepting our body with a "trait not implemented" that
 # looks like a library bug.
 my-http-client = { tag = "0.1.2", git = "https://github.com/MyJetTools/my-http-client.git" }
-tokio = { version = "*", features = ["sync"] }
+# `sync` for the mpsc channel a streamed body travels through, `rt` for the
+# `tokio::spawn` that runs an `upload_with_writer` producer alongside the request.
+# Neither is optional: without `rt` the crate builds only when some other crate in the
+# graph happens to turn it on.
+tokio = { version = "*", features = ["sync", "rt"] }
 
 [dev-dependencies]
 tokio = { version = "*", features = [
