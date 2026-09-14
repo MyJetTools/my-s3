@@ -293,11 +293,27 @@ impl S3Client {
     where
         TNewBody: FnMut() -> Receiver<Vec<u8>>,
     {
-        retry_while_retryable(max_retries, async || {
-            self.upload_streamed(bucket_name, key, new_body(), content_length, upload_timeout)
+        // The loop is written out here rather than shared through a helper that takes an
+        // `async ||` closure: an `AsyncFnMut` borrowing `self` left this future `Send`
+        // only for some lifetimes, so it could not be awaited inside `tokio::spawn` or
+        // an `#[async_trait]` method. `client_futures_are_send` holds that line.
+        let mut retries = 0;
+
+        loop {
+            let err = match self
+                .upload_streamed(bucket_name, key, new_body(), content_length, upload_timeout)
                 .await
-        })
-        .await
+            {
+                Ok(()) => return Ok(()),
+                Err(err) => err,
+            };
+
+            if retries >= max_retries || !err.is_retryable() {
+                return Err(err);
+            }
+
+            retries += 1;
+        }
     }
 
     /// [`Self::upload_streamed`] with the body written through a
@@ -445,19 +461,33 @@ impl S3Client {
         TProduce: FnMut(S3UploadWriter) -> TFuture,
         TFuture: Future<Output = std::io::Result<()>> + Send + 'static,
     {
-        retry_while_retryable(max_retries, async || {
-            // `&mut TProduce` is itself `FnOnce`, which is what lets one attempt take
-            // the closure by value without the loop losing it.
-            self.upload_with_writer(
-                bucket_name,
-                key,
-                content_length,
-                upload_timeout,
-                &mut produce,
-            )
-            .await
-        })
-        .await
+        // Written out for the same reason as in `upload_streamed_with_retries`, and kept
+        // identical to it: the retry rule must not drift between the two.
+        let mut retries = 0;
+
+        loop {
+            // `&mut TProduce` is itself `FnOnce`, which is what lets one attempt take the
+            // closure by value without the loop losing it.
+            let err = match self
+                .upload_with_writer(
+                    bucket_name,
+                    key,
+                    content_length,
+                    upload_timeout,
+                    &mut produce,
+                )
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(err) => err,
+            };
+
+            if retries >= max_retries || !err.is_retryable() {
+                return Err(err);
+            }
+
+            retries += 1;
+        }
     }
 
     pub async fn download_file(&self, bucket_name: &str, key: &str) -> Result<Vec<u8>, S3Error> {
@@ -1059,35 +1089,6 @@ impl S3Client {
         }
 
         println!("{}", format_response_trace(status_code, body));
-    }
-}
-
-/// The attempt loop both retrying uploads share.
-///
-/// It lives here rather than being written twice because the rule is subtle and must not
-/// drift: `max_retries` counts *retries*, so `max_retries + 1` attempts are made; a
-/// failure that [`S3Error::is_retryable`] rejects ends it at once, however many attempts
-/// are left; and the error returned is the last one, not the first.
-async fn retry_while_retryable<TAttempt>(
-    max_retries: usize,
-    mut attempt: TAttempt,
-) -> Result<(), S3Error>
-where
-    TAttempt: AsyncFnMut() -> Result<(), S3Error>,
-{
-    let mut retries = 0;
-
-    loop {
-        let err = match attempt().await {
-            Ok(()) => return Ok(()),
-            Err(err) => err,
-        };
-
-        if retries >= max_retries || !err.is_retryable() {
-            return Err(err);
-        }
-
-        retries += 1;
     }
 }
 

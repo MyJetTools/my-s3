@@ -2608,3 +2608,82 @@ async fn a_cancelled_read_is_resumed_without_a_second_get() {
     assert_eq!(server.request_count(), 2);
     assert_eq!(server.captured()[1].header("range"), Some("bytes=0-15"));
 }
+
+// ---------------------------------------------------------------------------
+// Every future the client hands out is Send
+// ---------------------------------------------------------------------------
+
+/// Takes the value rather than a type parameter: what has to be `Send` is the future a
+/// method *returns*, and that type has no name to write down.
+fn assert_send<T: Send>(_: T) {}
+
+/// Every public `async fn` must return a `Send` future, or it cannot be awaited inside
+/// `tokio::spawn`, an `#[async_trait]` method, or anything else that moves work between
+/// threads. Nothing is polled - this only has to compile - and the borrows are ordinary
+/// lifetimes rather than `'static`, because that is how a service holds its client.
+///
+/// Checking the returned *types* (`S3Reader: Send`, `S3UploadWriter: Send`) does not
+/// catch this: a future can fail to be `Send` while every type it produces is. The
+/// retrying uploads once did exactly that - an `AsyncFnMut` closure in the retry loop
+/// left their futures `Send` only for some lifetimes, which the compiler reports as
+/// "implementation of `Send` is not general enough".
+#[test]
+fn client_futures_are_send() {
+    fn check<'a>(
+        client: &'a my_s3::S3Client,
+        bucket_name: &'a str,
+        key: &'a str,
+        stream: &'a mut my_s3::S3DownloadStream,
+    ) {
+        let timeout = Duration::from_secs(1);
+
+        assert_send(client.upload(bucket_name, key, Vec::new(), timeout));
+        assert_send(client.upload_streamed(
+            bucket_name,
+            key,
+            tokio::sync::mpsc::channel::<Vec<u8>>(1).1,
+            0,
+            timeout,
+        ));
+        assert_send(
+            client.upload_streamed_with_retries(bucket_name, key, 0, timeout, 3, || {
+                tokio::sync::mpsc::channel::<Vec<u8>>(1).1
+            }),
+        );
+        assert_send(client.upload_with_writer(
+            bucket_name,
+            key,
+            0,
+            timeout,
+            |mut writer| async move { writer.shutdown().await },
+        ));
+        assert_send(client.upload_with_writer_with_retries(
+            bucket_name,
+            key,
+            0,
+            timeout,
+            3,
+            |mut writer| async move { writer.shutdown().await },
+        ));
+        assert_send(client.download_file(bucket_name, key));
+        assert_send(client.download_file_range(bucket_name, key, 0, None));
+        assert_send(client.download_file_as_stream(bucket_name, key));
+        assert_send(stream.get_next_chunk());
+        assert_send(client.open_reader(bucket_name, key));
+        assert_send(client.get_object_size(bucket_name, key));
+        assert_send(client.list_objects_v2(
+            bucket_name,
+            my_s3::S3ListObjectsRequest {
+                prefix: Some(key),
+                ..Default::default()
+            },
+        ));
+        assert_send(client.delete_file(bucket_name, key));
+        assert_send(client.create_bucket(bucket_name));
+        assert_send(client.create_bucket_if_not_exists(bucket_name));
+        assert_send(client.get_bucket_location(bucket_name));
+        assert_send(client.check_if_bucket_exists(bucket_name));
+    }
+
+    let _ = check;
+}
