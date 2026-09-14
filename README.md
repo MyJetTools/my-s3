@@ -9,8 +9,8 @@ It covers what a service actually does with object storage: put an object, get i
 delete it, list a bucket, and make sure the bucket is there. Objects larger than memory
 have a streaming path in both directions, and an object can be read as a seekable source
 or written as a sink — `AsyncRead + AsyncSeek` one way, `AsyncWrite` the other — so code
-written against `tokio::fs::File` works unchanged. It is deliberately not an SDK — there is no versioning, no ACLs, no lifecycle,
-no presigning.
+written against `tokio::fs::File` works unchanged. It is deliberately not an SDK — there
+is no versioning, no ACLs, no lifecycle, no presigning.
 
 ## Adding it
 
@@ -245,7 +245,8 @@ file writes an S3 object with no adapter, and the object is never held in memory
 ```rust
 use tokio::io::AsyncWriteExt;
 
-let length = tokio::fs::metadata(path).await?.len() as usize;
+let path = std::path::PathBuf::from("backup.tar");
+let length = tokio::fs::metadata(&path).await?.len() as usize;
 
 s3.upload_with_writer(
     "my-bucket",
@@ -253,7 +254,7 @@ s3.upload_with_writer(
     length,
     Duration::from_secs(600),
     |mut writer| async move {
-        let mut file = tokio::fs::File::open(path).await?;
+        let mut file = tokio::fs::File::open(&path).await?;
         tokio::io::copy(&mut file, &mut writer).await?;
         writer.shutdown().await          // sends the last chunk and ends the body
     },
@@ -262,20 +263,25 @@ s3.upload_with_writer(
 ```
 
 Anything shaped like `write_to(&mut impl AsyncWrite)` drops straight in — the producer
-never learns it is talking to S3.
+never learns it is talking to S3. It does run on a task of its own, so its future must be
+`Send + 'static`: move in (or `Arc`) whatever it reads from, as the `path` above is, rather
+than borrowing the caller's locals.
 
 Underneath it *is* `upload_streamed`: the writer fills a 512 KiB chunk, the chunk goes
 into the same bounded channel, and the same single request sends it. The producer runs
 concurrently with the upload — it has to, since the channel is bounded and the upload is
-what drains it — and the call returns only once both have finished. Peak memory is the
-chunk being filled plus the four the channel holds, about 2.5 MiB, whatever the size of
-the object.
+what drains it — and the call returns only once both have finished. Peak memory is a
+handful of chunks — the four queued in the channel, one waiting to join them, the one the
+HTTP client is writing, and the buffer being filled — at most about 3.5 MiB, whatever the
+size of the object.
 
 - **`content_length` must be exact**, for the same reason as in `upload_streamed`. Here
   the writer enforces it too: the byte that would go past it is refused with
   `io::ErrorKind::InvalidInput` and never sent, rather than quietly dropped.
-- **`shutdown` is not optional.** It is what sends the last partial chunk and ends the
-  body. A producer that just returns has written less than it declared.
+- **End with `shutdown`.** It sends the last partial chunk and ends the body, and it is
+  the only ending that does not depend on how the producer happened to write. A producer
+  that returns with a partial chunk still buffered has not sent everything it declared,
+  and gets an error for it, never a success.
 - **Retries re-run the producer**, with a fresh writer, from the beginning —
   `upload_with_writer_with_retries` runs that loop on the same terms as
   `upload_streamed_with_retries`. A streamed body is consumed as it is sent, so there is
@@ -288,7 +294,7 @@ comes back matters:
 | --- | --- |
 | The producer failed on its own | `S3Error::UploadProducerFailed` with its `io::Error` — never the storage's complaint about a short body, which is only the consequence. Not retryable: the source is what has to change. |
 | The upload died while the producer was still writing | The **S3 error** that says why. The producer sees `io::ErrorKind::BrokenPipe`, which is how it finds out to stop, but `BrokenPipe` explains nothing and is not what surfaces. |
-| The producer returned `Ok` having written too little | `S3Error::UploadProducerFailed` with `io::ErrorKind::UnexpectedEof`, never a success. Usually a missing `shutdown`. |
+| The producer returned `Ok` but not every declared byte went out | `S3Error::UploadProducerFailed` with `io::ErrorKind::UnexpectedEof`, never a success — a source that ended early, or a missing `shutdown` that left the last chunk unsent. |
 
 ```rust
 if let Some(err) = err.get_upload_producer_error() {

@@ -726,6 +726,240 @@ async fn an_upload_that_dies_mid_body_gives_the_producer_broken_pipe() {
     );
 }
 
+/// The mistake the docs warn about most: every byte was written, `shutdown` was not
+/// called, and the last partial chunk is still in the writer when it is dropped. The
+/// count of bytes *accepted* equals `content_length` here, so this is exactly the case
+/// that a check measuring the wrong thing lets through as a transport error - and a
+/// transport error might get retried, re-running a producer that will forget again.
+#[tokio::test]
+async fn a_producer_that_forgets_shutdown_with_a_partial_chunk_is_never_a_success() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = calls.clone();
+
+    // One full 512 KiB chunk goes out on its own; the 188 KB tail only goes out on
+    // shutdown, which never comes.
+    let length = 700_000;
+
+    let err = client
+        .upload_with_writer_with_retries(
+            "my-bucket",
+            "archives/no-shutdown.bin",
+            length,
+            UPLOAD_TIMEOUT,
+            3,
+            move |mut writer| {
+                let calls = counted.clone();
+                async move {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    writer.write_all(&pattern(length)).await?;
+                    Ok(())
+                }
+            },
+        )
+        .await
+        .unwrap_err();
+
+    let io_error = err
+        .get_upload_producer_error()
+        .expect("a body that never went out whole is the producer's failure, not the storage's");
+
+    assert_eq!(io_error.kind(), std::io::ErrorKind::UnexpectedEof);
+    assert!(
+        io_error.to_string().contains("524288 of the 700000"),
+        "the error has to say how much really went out, got: {}",
+        io_error
+    );
+
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::Acquire),
+        1,
+        "a producer that forgets shutdown will forget it again - do not retry it"
+    );
+    assert_eq!(
+        server.uploaded_object("my-bucket", "archives/no-shutdown.bin"),
+        None
+    );
+}
+
+/// The counterpart: when the length lands exactly on a chunk boundary, every chunk was
+/// sent by `poll_write` itself and dropping the writer ends a body that is already
+/// complete. That is a correct upload, and it must not be refused for a missing call
+/// that had nothing left to send.
+#[tokio::test]
+async fn a_producer_that_forgets_shutdown_on_a_chunk_boundary_still_delivers() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    let content = pattern(2 * my_s3::DEFAULT_UPLOAD_CHUNK_SIZE);
+    let expected = content.clone();
+
+    client
+        .upload_with_writer(
+            "my-bucket",
+            "archives/boundary.bin",
+            content.len(),
+            UPLOAD_TIMEOUT,
+            |mut writer| async move {
+                writer.write_all(&content).await?;
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        server.uploaded_object("my-bucket", "archives/boundary.bin"),
+        Some(expected)
+    );
+}
+
+/// An empty object is a legitimate one - an empty archive, a marker file - and it is the
+/// one case where the producer's only job is to end the body.
+#[tokio::test]
+async fn a_zero_length_object_is_one_put_with_an_empty_body() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    client
+        .upload_with_writer(
+            "my-bucket",
+            "archives/empty.bin",
+            0,
+            UPLOAD_TIMEOUT,
+            |mut writer| async move { writer.shutdown().await },
+        )
+        .await
+        .unwrap();
+
+    let captured = server.captured();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].method, "PUT");
+    assert_eq!(captured[0].header("content-length"), Some("0"));
+    assert!(captured[0].body_complete);
+
+    assert_eq!(
+        server.uploaded_object("my-bucket", "archives/empty.bin"),
+        Some(Vec::new())
+    );
+}
+
+/// `flush` sends what is buffered without ending the body, so a producer may flush as
+/// often as it likes - after every record, say - and keep writing.
+#[tokio::test]
+async fn flushing_mid_stream_does_not_end_the_body() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    let content = pattern(800_000);
+    let expected = content.clone();
+
+    client
+        .upload_with_writer(
+            "my-bucket",
+            "archives/flushed.bin",
+            content.len(),
+            UPLOAD_TIMEOUT,
+            |mut writer| async move {
+                for piece in content.chunks(100_000) {
+                    writer.write_all(piece).await?;
+                    writer.flush().await?;
+                }
+                writer.shutdown().await
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        server.uploaded_object("my-bucket", "archives/flushed.bin"),
+        Some(expected)
+    );
+}
+
+/// After `shutdown` the body has ended and there is nowhere for more bytes to go. The
+/// refusal is `BrokenPipe`, the same answer a closed socket gives - and, because the
+/// producer chose to report it, the call fails even though the body itself was
+/// complete: a producer's `Err` is never turned into a success.
+#[tokio::test]
+async fn writing_after_shutdown_is_refused() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let reported = seen.clone();
+
+    let err = client
+        .upload_with_writer(
+            "my-bucket",
+            "archives/after.bin",
+            1_000,
+            UPLOAD_TIMEOUT,
+            move |mut writer| async move {
+                writer.write_all(&pattern(1_000)).await?;
+                writer.shutdown().await?;
+
+                let err = writer
+                    .write_all(b"late")
+                    .await
+                    .expect_err("the body has ended");
+                *reported.lock().unwrap() = Some(err.kind());
+
+                Err(err)
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(*seen.lock().unwrap(), Some(std::io::ErrorKind::BrokenPipe));
+    assert_eq!(
+        err.get_upload_producer_error().map(|err| err.kind()),
+        Some(std::io::ErrorKind::BrokenPipe),
+        "the producer's own error, got: {}",
+        err
+    );
+}
+
+/// A producer that panics has not produced the body. The panic must not take the
+/// caller's task down with it, and it must not be mistaken for anything but a failure.
+#[tokio::test]
+async fn a_producer_that_panics_is_never_a_success() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    let err = client
+        .upload_with_writer(
+            "my-bucket",
+            "archives/panicked.bin",
+            1_000,
+            UPLOAD_TIMEOUT,
+            |mut writer| async move {
+                writer.write_all(&pattern(500)).await?;
+                panic!("the archive source is corrupt");
+            },
+        )
+        .await
+        .unwrap_err();
+
+    let io_error = err
+        .get_upload_producer_error()
+        .expect("a panicking producer is a producer failure");
+
+    assert!(
+        io_error.to_string().contains("did not finish"),
+        "got: {}",
+        io_error
+    );
+    assert!(!err.is_retryable());
+
+    assert_eq!(
+        server.uploaded_object("my-bucket", "archives/panicked.bin"),
+        None
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Delete: the 204 bug
 // ---------------------------------------------------------------------------

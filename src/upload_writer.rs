@@ -14,7 +14,7 @@ use tokio::sync::mpsc::{Receiver, Sender, channel};
 /// hand: large enough that a producer writing 8 KiB at a time (which is what
 /// [`tokio::io::copy`] does) costs one channel send per 64 writes instead of one per
 /// write, and small enough that peak memory stays a rounding error next to the object.
-pub const DEFAULT_UPLOAD_CHUNK_SIZE: usize = 4 * 1024 * 1024;
+pub const DEFAULT_UPLOAD_CHUNK_SIZE: usize = 512 * 1024;
 
 /// How many finished chunks may sit in the channel before the writer has to wait.
 ///
@@ -39,9 +39,14 @@ type PendingSend = Pin<Box<dyn Future<Output = bool> + Send>>;
 /// [`S3Client::upload_with_writer`]: crate::S3Client::upload_with_writer
 pub(crate) struct UploadWriterState {
     /// Bytes taken from the producer - buffered or sent, but never more than
-    /// `content_length`. What makes "finished early" detectable when the producer
-    /// itself reports success.
+    /// `content_length`. What the `content_length` cap in `poll_write` is measured
+    /// against.
     accepted: AtomicU64,
+    /// Bytes that reached the channel, i.e. that the upload could actually send. This,
+    /// not `accepted`, is what says whether the body was delivered: a partial chunk
+    /// left in the buffer by a producer that never called `shutdown` has been
+    /// accepted and has gone nowhere.
+    sent: AtomicU64,
     /// Set the first time a send finds the channel closed. That only happens when the
     /// upload has already ended, which makes everything the producer reports afterwards
     /// a consequence rather than a cause.
@@ -52,12 +57,17 @@ impl UploadWriterState {
     fn new() -> Self {
         Self {
             accepted: AtomicU64::new(0),
+            sent: AtomicU64::new(0),
             upload_ended: AtomicBool::new(false),
         }
     }
 
     pub(crate) fn accepted(&self) -> u64 {
         self.accepted.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn sent(&self) -> u64 {
+        self.sent.load(Ordering::Acquire)
     }
 
     pub(crate) fn upload_ended(&self) -> bool {
@@ -98,16 +108,19 @@ impl UploadWriterState {
 /// # What it costs
 ///
 /// Writes accumulate into a [`DEFAULT_UPLOAD_CHUNK_SIZE`] buffer, and a full chunk goes
-/// into a bounded channel that the upload drains. Peak memory is the chunk being filled
-/// plus what the channel holds - about 2.5 MiB at the defaults - whatever the size of
-/// the object.
+/// into a bounded channel that the upload drains. Peak memory is a handful of chunks -
+/// the four queued in the channel, one waiting to join them, the one the HTTP client is
+/// writing, and the buffer being filled - at most about 3.5 MiB at the defaults,
+/// whatever the size of the object.
 ///
-/// # `shutdown` is not optional
+/// # End with `shutdown`
 ///
-/// [`AsyncWriteExt::shutdown`] is what sends the last partial chunk and ends the body.
-/// A producer that returns without it delivers fewer bytes than it declared, and
-/// [`S3Client::upload_with_writer`] turns that into an error rather than a success -
-/// but the error says "finished early", which is a worse thing to read than the missing
+/// [`AsyncWriteExt::shutdown`] sends the last partial chunk and ends the body. It is the
+/// only ending that does not depend on how the producer happened to write: dropping the
+/// writer also ends the body, but sends nothing first, so a producer that returns with
+/// a partial chunk still buffered has delivered fewer bytes than it declared.
+/// [`S3Client::upload_with_writer`] reports that as an error, never as a success - but
+/// as "only N of M bytes went out", which is a worse thing to read than the missing
 /// line.
 ///
 /// # Writing past `content_length` is refused, not truncated
@@ -262,7 +275,21 @@ impl S3UploadWriter {
         // everything it touches to be stored in a field, exactly as `S3Reader` boxes its
         // `GET`. It is dropped with the future, so it cannot outlive the send and hold
         // the body open.
-        let mut pending: PendingSend = Box::pin(async move { sender.send(chunk).await.is_ok() });
+        // Counted inside the send, by the send: a chunk is delivered exactly when the
+        // channel takes it, and that moment belongs to whichever `poll_*` call happens
+        // to drive the future there.
+        let state = self.state.clone();
+
+        let mut pending: PendingSend = Box::pin(async move {
+            let length = chunk.len() as u64;
+
+            if sender.send(chunk).await.is_err() {
+                return false;
+            }
+
+            state.sent.fetch_add(length, Ordering::AcqRel);
+            true
+        });
 
         match pending.as_mut().poll(cx) {
             Poll::Pending => {
@@ -302,6 +329,14 @@ impl AsyncWrite for S3UploadWriter {
 
         if this.sender.is_none() {
             return Poll::Ready(Err(this.already_shut_down()));
+        }
+
+        // A send has already found the channel closed. Every later write is refused with
+        // the same `BrokenPipe`, rather than whatever the byte count happens to make of
+        // it - a producer that ignores the first one and keeps writing past the end
+        // must not be told it miscounted.
+        if this.state.upload_ended() {
+            return Poll::Ready(Err(this.upload_is_gone()));
         }
 
         let accepted = this.state.accepted();
@@ -412,124 +447,5 @@ impl std::fmt::Debug for S3UploadWriter {
             .field("send_in_flight", &self.pending.is_some())
             .field("body_ended", &self.sender.is_none())
             .finish_non_exhaustive()
-    }
-}
-
-#[cfg(test)]
-mod contract_probe {
-    use super::*;
-    use std::sync::atomic::AtomicUsize;
-    use std::task::{RawWaker, RawWakerVTable, Waker};
-
-    static WAKES: AtomicUsize = AtomicUsize::new(0);
-
-    fn counting_waker() -> Waker {
-        fn clone(p: *const ()) -> RawWaker { RawWaker::new(p, &VT) }
-        fn wake(_: *const ()) { WAKES.fetch_add(1, Ordering::SeqCst); }
-        fn wake_by_ref(_: *const ()) { WAKES.fetch_add(1, Ordering::SeqCst); }
-        fn drop_it(_: *const ()) {}
-        static VT: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop_it);
-        unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VT)) }
-    }
-
-    /// Fill the channel (capacity 4) + park a 5th send, then confirm:
-    ///  - poll_write never returns Pending having consumed bytes
-    ///  - the Pending it does return has a registered waker (draining wakes it)
-    ///  - no byte is lost or duplicated
-    #[test]
-    fn write_never_returns_pending_after_consuming_and_always_registers_a_waker() {
-        let chunk = 16usize;
-        let total = chunk * 20;
-        let (mut w, mut rx, state) = S3UploadWriter::new("b", "k", total, chunk);
-
-        let waker = counting_waker();
-        let mut cx = Context::from_waker(&waker);
-
-        let src: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
-        let mut offset = 0usize;
-        let mut drained: Vec<u8> = Vec::new();
-        let mut pending_rounds = 0;
-
-        while offset < total {
-            let before = state.accepted();
-            match Pin::new(&mut w).poll_write(&mut cx, &src[offset..]) {
-                Poll::Ready(Ok(n)) => {
-                    assert!(n > 0, "Ok(0) on a non-empty buf => WriteZero");
-                    assert!(n <= total - offset, "reported more than offered");
-                    assert_eq!(state.accepted(), before + n as u64, "accepted disagrees with the reported count");
-                    offset += n;
-                }
-                Poll::Pending => {
-                    assert_eq!(state.accepted(), before, "PENDING AFTER CONSUMING BYTES");
-                    pending_rounds += 1;
-                    assert!(pending_rounds < 10_000, "no progress");
-                    // The channel is full. Drain one and confirm the waker fires.
-                    let wakes_before = WAKES.load(Ordering::SeqCst);
-                    let got = rx.blocking_recv().expect("sender alive");
-                    drained.extend_from_slice(&got);
-                    // give the mpsc a moment to run the waker
-                    std::thread::yield_now();
-                    assert!(
-                        WAKES.load(Ordering::SeqCst) > wakes_before,
-                        "NO WAKER REGISTERED on the Pending return"
-                    );
-                }
-                Poll::Ready(Err(e)) => panic!("unexpected error: {}", e),
-            }
-        }
-
-        // shutdown, draining as needed
-        loop {
-            match Pin::new(&mut w).poll_shutdown(&mut cx) {
-                Poll::Ready(Ok(())) => break,
-                Poll::Ready(Err(e)) => panic!("shutdown error: {}", e),
-                Poll::Pending => {
-                    let got = rx.blocking_recv().expect("sender alive");
-                    drained.extend_from_slice(&got);
-                }
-            }
-        }
-
-        while let Ok(got) = rx.try_recv() {
-            drained.extend_from_slice(&got);
-        }
-
-        assert_eq!(drained.len(), total, "bytes lost or duplicated");
-        assert_eq!(drained, src, "byte stream corrupted");
-        assert_eq!(state.accepted(), total as u64);
-
-        // idempotent shutdown
-        assert!(matches!(Pin::new(&mut w).poll_shutdown(&mut cx), Poll::Ready(Ok(()))));
-        assert!(matches!(Pin::new(&mut w).poll_flush(&mut cx), Poll::Ready(Ok(()))));
-        // one byte past the end
-        let e = match Pin::new(&mut w).poll_write(&mut cx, b"x") {
-            Poll::Ready(Err(e)) => e,
-            other => panic!("expected an error, got {:?}", other.is_pending()),
-        };
-        println!("PROBE-C past-end-after-shutdown kind={:?}", e.kind());
-    }
-
-    /// content_length exceeded while the writer is still open.
-    #[test]
-    fn past_content_length_is_invalid_input_and_sends_nothing_extra() {
-        let (mut w, mut rx, _state) = S3UploadWriter::new("b", "k", 10, 4);
-        let waker = counting_waker();
-        let mut cx = Context::from_waker(&waker);
-
-        let mut written = 0;
-        let data = vec![7u8; 25];
-        let mut got = Vec::new();
-        let mut err = None;
-        while written < data.len() {
-            match Pin::new(&mut w).poll_write(&mut cx, &data[written..]) {
-                Poll::Ready(Ok(n)) => written += n,
-                Poll::Ready(Err(e)) => { err = Some(e); break; }
-                Poll::Pending => { got.extend_from_slice(&rx.blocking_recv().unwrap()); }
-            }
-        }
-        let err = err.expect("must refuse");
-        println!("PROBE-C over kind={:?} consumed={}", err.kind(), written);
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-        assert_eq!(written, 10, "must not consume past content_length");
     }
 }

@@ -318,10 +318,15 @@ impl S3Client {
     /// [`Self::upload_streamed`] spells out. Here the writer also enforces it: a byte
     /// past it is refused with [`std::io::ErrorKind::InvalidInput`] rather than sent.
     ///
-    /// # The producer must `shutdown` the writer
+    /// # The producer should end with `shutdown`
     ///
     /// `tokio::io::AsyncWriteExt::shutdown` sends the last partial chunk and ends the
-    /// body. A producer that just returns leaves that chunk unsent.
+    /// body. It is the only ending that does not depend on how the producer happened to
+    /// write: a producer that returns with a partial chunk still buffered has not sent
+    /// every byte it declared, and gets the error below.
+    ///
+    /// The producer runs on a task of its own, so its future is `Send + 'static` - it
+    /// owns, or holds an `Arc` of, whatever it reads from.
     ///
     /// # Which error comes back
     ///
@@ -335,9 +340,10 @@ impl S3Client {
     /// - **The upload failed while the producer was still writing**: the producer sees
     ///   [`std::io::ErrorKind::BrokenPipe`] and stops, and the error returned here is
     ///   the **S3 one** that says why. Ask [`S3Error::is_retryable`] as usual.
-    /// - **The producer returned `Ok` having written less than `content_length`**: an
-    ///   error, never a success - [`S3Error::UploadProducerFailed`] with
-    ///   [`std::io::ErrorKind::UnexpectedEof`]. Usually a missing `shutdown`.
+    /// - **The producer returned `Ok` but fewer than `content_length` bytes went out**:
+    ///   an error, never a success - [`S3Error::UploadProducerFailed`] with
+    ///   [`std::io::ErrorKind::UnexpectedEof`]. Either the source ended early, or a
+    ///   missing `shutdown` left the last partial chunk unsent.
     ///
     /// ```no_run
     /// # async fn doc(s3: &my_s3::S3Client, path: &'static str) -> Result<(), my_s3::S3Error> {
@@ -1098,7 +1104,9 @@ where
 ///
 /// A producer that returns `Ok` having delivered less than it declared is a failure of
 /// the same kind, and is caught here rather than left to the storage: the storage would
-/// report it as a malformed request, or - with an unlucky server - not at all.
+/// report it as a malformed request, or - with an unlucky server - not at all. Delivery
+/// is measured by what reached the channel, not by what went into the writer - a partial
+/// chunk left buffered by a producer that never called `shutdown` went nowhere.
 fn finish_upload_with_writer(
     upload_result: Result<(), S3Error>,
     produce_result: Result<std::io::Result<()>, tokio::task::JoinError>,
@@ -1116,13 +1124,13 @@ fn finish_upload_with_writer(
         Ok(Err(err)) => Some(err),
 
         Ok(Ok(())) => {
-            let delivered = state.accepted();
+            let delivered = state.sent();
 
             if delivered < content_length as u64 {
                 Some(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
                     format!(
-                        "the upload body producer reported success after writing {} of the {} bytes it declared - a missing shutdown() leaves the last chunk unsent",
+                        "the upload body producer reported success but only {} of the {} bytes it declared went out - either the source ended early, or a missing shutdown() left the last partial chunk unsent",
                         delivered, content_length
                     ),
                 ))

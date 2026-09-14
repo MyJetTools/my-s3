@@ -214,17 +214,7 @@ impl std::fmt::Display for S3Error {
     }
 }
 
-impl std::error::Error for S3Error {
-    /// Only [`S3Error::UploadProducerFailed`] has one: the producer's `io::Error` is a
-    /// real error of its own, often wrapping the caller's, and `?` in an
-    /// `io::Error`-shaped caller should be able to walk back to it.
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::UploadProducerFailed(err) => Some(err),
-            _ => None,
-        }
-    }
-}
+impl std::error::Error for S3Error {}
 
 impl From<FlUrlError> for S3Error {
     fn from(value: FlUrlError) -> Self {
