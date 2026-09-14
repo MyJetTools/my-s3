@@ -264,7 +264,10 @@ fn required(value: Option<String>, element: &str) -> Result<String, S3Error> {
 }
 
 fn malformed(err: String) -> S3Error {
-    S3Error::Other(format!("ListObjectsV2 answered with malformed XML: {}", err))
+    S3Error::Other(format!(
+        "ListObjectsV2 answered with malformed XML: {}",
+        err
+    ))
 }
 
 #[cfg(test)]
@@ -456,7 +459,10 @@ mod tests {
 
         assert_eq!(page.common_prefixes, ["photos/2023/", "photos/2024/"]);
         assert_eq!(
-            page.objects.iter().map(|o| o.key.as_str()).collect::<Vec<_>>(),
+            page.objects
+                .iter()
+                .map(|o| o.key.as_str())
+                .collect::<Vec<_>>(),
             ["photos/a.jpg", "photos/b.jpg"]
         );
         assert_eq!(page.objects[0].size, 10);
@@ -525,7 +531,13 @@ mod tests {
   <Contents><Key>b</Key><LastModified>t</LastModified><Size>2</Size></Contents>
 </ListBucketResult>"#;
 
-        assert_eq!(parse_list_objects_v2(complete.as_bytes()).unwrap().objects.len(), 2);
+        assert_eq!(
+            parse_list_objects_v2(complete.as_bytes())
+                .unwrap()
+                .objects
+                .len(),
+            2
+        );
 
         // The same answer, with the connection dying after the first entry.
         let cut = &complete[..complete.find("<Contents><Key>b").unwrap()];
@@ -540,8 +552,7 @@ mod tests {
     /// process, and none may be read as an empty-but-valid listing.
     #[test]
     fn a_mangled_body_is_an_error_not_a_panic() {
-        let truncated_mid_key =
-            b"<ListBucketResult><Contents><Key>half".as_slice();
+        let truncated_mid_key = b"<ListBucketResult><Contents><Key>half".as_slice();
         let mut invalid_utf8 = b"<ListBucketResult><Contents><Key>".to_vec();
         invalid_utf8.extend_from_slice(&[0xFF, 0xFE]);
         invalid_utf8.extend_from_slice(b"</Key></Contents></ListBucketResult>");

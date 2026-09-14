@@ -370,7 +370,9 @@ mod tests {
         assert!(is_safe_to_read(b""));
         assert!(is_safe_to_read(b"not xml at all"));
         assert!(!is_safe_to_read(b"</A>"));
-        assert!(!is_safe_to_read(&[b'<', b'A', b'>', 0xFF, b'<', b'/', b'A', b'>']));
+        assert!(!is_safe_to_read(&[
+            b'<', b'A', b'>', 0xFF, b'<', b'/', b'A', b'>'
+        ]));
     }
 
     /// A body the connection cut short is the dangerous kind of malformed: the reader

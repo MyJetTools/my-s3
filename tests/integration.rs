@@ -1447,3 +1447,527 @@ fn the_fake_server_canonicalises_a_query_the_way_a_real_one_does() {
 &delimiter=%2F&list-type=2&prefix=photos%2F2024%20summer%2F";
     assert_eq!(fake_s3::canonical_query(ours), ours);
 }
+
+// ---------------------------------------------------------------------------
+// S3Reader - one object as a seekable source
+// ---------------------------------------------------------------------------
+
+/// A pattern rather than a constant byte, so that a slice taken at the wrong offset is
+/// visibly the wrong slice. 251 is prime, so the period never lines up with a
+/// power-of-two page size.
+fn object_of(size: usize) -> Vec<u8> {
+    (0..size).map(|index| (index % 251) as u8).collect()
+}
+
+/// Opening reports the size and costs exactly one request - the `HEAD`.
+#[tokio::test]
+async fn opening_a_reader_costs_one_head() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    server.put_object("my-bucket", "a.bin", object_of(4096));
+
+    let reader = client.open_reader("my-bucket", "a.bin").await.unwrap();
+
+    assert_eq!(reader.size(), 4096);
+    assert_eq!(reader.position(), 0);
+
+    let captured = server.captured();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].method, "HEAD");
+    assert_eq!(captured[0].target, "/my-bucket/a.bin");
+    assert!(captured[0].signature_valid);
+}
+
+/// `HEAD` on its own, without a reader.
+#[tokio::test]
+async fn get_object_size_reads_content_length() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    server.put_object("my-bucket", "a.bin", object_of(12_345));
+
+    assert_eq!(
+        client.get_object_size("my-bucket", "a.bin").await.unwrap(),
+        12_345
+    );
+    assert_eq!(server.captured()[0].method, "HEAD");
+}
+
+/// The point of the whole type: seek to an offset, read a page, get *those* bytes.
+#[tokio::test]
+async fn seek_then_read_exact_returns_the_bytes_at_that_offset() {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    let content = object_of(100_000);
+    server.put_object("my-bucket", "a.bin", content.clone());
+
+    let mut reader = client.open_reader("my-bucket", "a.bin").await.unwrap();
+
+    let offset = 40_960u64;
+    let length = 16 * 1024usize;
+
+    reader.seek(std::io::SeekFrom::Start(offset)).await.unwrap();
+
+    let mut page = vec![0u8; length];
+    reader.read_exact(&mut page).await.unwrap();
+
+    assert_eq!(page, content[offset as usize..offset as usize + length]);
+    assert_eq!(reader.position(), offset + length as u64);
+}
+
+/// One `read_exact` of a page is **one** `GET`, for exactly that range - no read-ahead,
+/// no splitting.
+#[tokio::test]
+async fn one_read_exact_of_a_page_is_one_get() {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    server.put_object("my-bucket", "a.bin", object_of(100_000));
+
+    let mut reader = client.open_reader("my-bucket", "a.bin").await.unwrap();
+    reader.seek(std::io::SeekFrom::Start(3_000)).await.unwrap();
+
+    let mut page = vec![0u8; 3 * 1024];
+    reader.read_exact(&mut page).await.unwrap();
+
+    // The HEAD that opened it, and one GET. Nothing else.
+    assert_eq!(server.request_count(), 2);
+
+    let captured = server.captured();
+    assert_eq!(captured[1].method, "GET");
+    assert_eq!(captured[1].target, "/my-bucket/a.bin");
+    // Inclusive offsets: 3000 + 3072 - 1.
+    assert_eq!(captured[1].header("range"), Some("bytes=3000-6071"));
+    assert!(captured[1].signature_valid);
+}
+
+/// Reading on from where the last read stopped, without seeking - the sequential case.
+#[tokio::test]
+async fn consecutive_reads_continue_where_the_last_one_stopped() {
+    use tokio::io::AsyncReadExt;
+
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    let content = object_of(10_000);
+    server.put_object("my-bucket", "a.bin", content.clone());
+
+    let mut reader = client.open_reader("my-bucket", "a.bin").await.unwrap();
+
+    let mut first = vec![0u8; 100];
+    reader.read_exact(&mut first).await.unwrap();
+
+    let mut second = vec![0u8; 100];
+    reader.read_exact(&mut second).await.unwrap();
+
+    assert_eq!(first, content[..100]);
+    assert_eq!(second, content[100..200]);
+    assert_eq!(reader.position(), 200);
+
+    let captured = server.captured();
+    assert_eq!(captured.len(), 3);
+    assert_eq!(captured[1].header("range"), Some("bytes=0-99"));
+    assert_eq!(captured[2].header("range"), Some("bytes=100-199"));
+}
+
+/// `Current` and `End` are resolved against the position and the size the `HEAD`
+/// reported - neither costs a request.
+#[tokio::test]
+async fn relative_seeks_land_where_they_should() {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    let content = object_of(1_000);
+    server.put_object("my-bucket", "a.bin", content.clone());
+
+    let mut reader = client.open_reader("my-bucket", "a.bin").await.unwrap();
+
+    assert_eq!(
+        reader.seek(std::io::SeekFrom::Start(100)).await.unwrap(),
+        100
+    );
+    assert_eq!(
+        reader.seek(std::io::SeekFrom::Current(50)).await.unwrap(),
+        150
+    );
+    assert_eq!(
+        reader.seek(std::io::SeekFrom::Current(-25)).await.unwrap(),
+        125
+    );
+    assert_eq!(reader.seek(std::io::SeekFrom::End(-10)).await.unwrap(), 990);
+    assert_eq!(reader.seek(std::io::SeekFrom::End(0)).await.unwrap(), 1_000);
+
+    // Not one request so far: only the HEAD that opened it.
+    assert_eq!(server.request_count(), 1);
+
+    // And the position a relative seek left behind is the one that gets read.
+    reader.seek(std::io::SeekFrom::End(-4)).await.unwrap();
+    let mut tail = [0u8; 4];
+    reader.read_exact(&mut tail).await.unwrap();
+    assert_eq!(tail.as_slice(), &content[996..]);
+}
+
+/// A relative seek is resolved against the position a *read* left behind, not against
+/// the last seek.
+#[tokio::test]
+async fn seek_current_counts_from_where_reading_stopped() {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    let content = object_of(1_000);
+    server.put_object("my-bucket", "a.bin", content.clone());
+
+    let mut reader = client.open_reader("my-bucket", "a.bin").await.unwrap();
+
+    let mut buffer = [0u8; 40];
+    reader.read_exact(&mut buffer).await.unwrap();
+
+    assert_eq!(
+        reader.seek(std::io::SeekFrom::Current(10)).await.unwrap(),
+        50
+    );
+
+    let mut next = [0u8; 4];
+    reader.read_exact(&mut next).await.unwrap();
+    assert_eq!(next.as_slice(), &content[50..54]);
+}
+
+/// Seeking before the start of the object is refused, and refused *without* a request.
+#[tokio::test]
+async fn seeking_before_the_start_is_invalid_input() {
+    use tokio::io::AsyncSeekExt;
+
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    server.put_object("my-bucket", "a.bin", object_of(1_000));
+
+    let mut reader = client.open_reader("my-bucket", "a.bin").await.unwrap();
+
+    let err = reader
+        .seek(std::io::SeekFrom::Current(-1))
+        .await
+        .unwrap_err();
+
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+    let err = reader
+        .seek(std::io::SeekFrom::End(-1_001))
+        .await
+        .unwrap_err();
+
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+    // The failed seeks left the position alone, and nothing went out.
+    assert_eq!(reader.position(), 0);
+    assert_eq!(server.request_count(), 1);
+}
+
+/// At the end and past it, a read is end-of-file: zero bytes, and **no request** - the
+/// size has been known since the `HEAD`. Seeking past the end is allowed, exactly as it
+/// is on a file.
+#[tokio::test]
+async fn reading_at_or_past_the_end_returns_nothing_and_asks_nothing() {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    server.put_object("my-bucket", "a.bin", object_of(1_000));
+
+    let mut reader = client.open_reader("my-bucket", "a.bin").await.unwrap();
+
+    reader.seek(std::io::SeekFrom::Start(1_000)).await.unwrap();
+    let mut buffer = [0u8; 64];
+    assert_eq!(reader.read(&mut buffer).await.unwrap(), 0);
+
+    reader
+        .seek(std::io::SeekFrom::Start(10_000_000))
+        .await
+        .unwrap();
+    assert_eq!(reader.read(&mut buffer).await.unwrap(), 0);
+
+    // Still only the HEAD that opened it.
+    assert_eq!(server.request_count(), 1);
+}
+
+/// A `read_exact` that runs off the end must fail, not come back short: a caller that
+/// asked for a page and got half of one would parse the half as the page.
+#[tokio::test]
+async fn a_read_exact_crossing_the_end_is_unexpected_eof() {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    server.put_object("my-bucket", "a.bin", object_of(1_000));
+
+    let mut reader = client.open_reader("my-bucket", "a.bin").await.unwrap();
+    reader.seek(std::io::SeekFrom::Start(990)).await.unwrap();
+
+    let mut page = [0u8; 64];
+    let err = reader.read_exact(&mut page).await.unwrap_err();
+
+    assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+
+    // The range that *was* readable was never asked for past the end of the object -
+    // that would be a 416 rather than an end of file.
+    let captured = server.captured();
+    assert_eq!(captured[1].header("range"), Some("bytes=990-999"));
+}
+
+/// A `206` that delivers less than the range it acknowledged is a truncation, not a
+/// short read.
+#[tokio::test]
+async fn a_body_shorter_than_the_range_is_unexpected_eof() {
+    use tokio::io::AsyncReadExt;
+
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    server.put_object("my-bucket", "a.bin", object_of(1_000));
+
+    let mut reader = client.open_reader("my-bucket", "a.bin").await.unwrap();
+
+    // Queued after opening, so it answers the GET and not the HEAD.
+    server.push_reply(206, "short");
+
+    let mut page = [0u8; 64];
+    let err = reader.read_exact(&mut page).await.unwrap_err();
+
+    assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+}
+
+/// A server that ignores `Range` and returns the whole object is an error, not 64 bytes
+/// taken off the front of something else.
+#[tokio::test]
+async fn a_range_answered_with_200_is_an_error_for_the_reader_too() {
+    use tokio::io::AsyncReadExt;
+
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    server.put_object("my-bucket", "a.bin", object_of(1_000));
+
+    let mut reader = client.open_reader("my-bucket", "a.bin").await.unwrap();
+
+    server.push_reply(200, "the whole object, which is not what was asked for");
+
+    let mut page = [0u8; 64];
+    let err = reader.read_exact(&mut page).await.unwrap_err();
+
+    assert!(err.to_string().contains("ignored the Range header"));
+}
+
+/// "There is no such object" is answered when the reader is *opened*, and as the typed
+/// error - not as an `io::Error` at the first read.
+#[tokio::test]
+async fn a_missing_key_is_reported_when_the_reader_is_opened() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    // Something is stored, so the server is serving objects - just not this one.
+    server.put_object("my-bucket", "a.bin", object_of(10));
+
+    let err = client
+        .open_reader("my-bucket", "missing.bin")
+        .await
+        .unwrap_err();
+
+    assert!(err.is_key_not_found());
+}
+
+/// Same for `get_object_size` on its own: a `HEAD` carries no body, so the bare `404` is
+/// all there is to go on.
+#[tokio::test]
+async fn a_missing_key_has_no_size() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    server.push_reply(404, "");
+
+    let err = client
+        .get_object_size("my-bucket", "missing.bin")
+        .await
+        .unwrap_err();
+
+    assert!(err.is_key_not_found());
+}
+
+/// Everything that is not a missing key keeps the `S3Error` reachable through the
+/// `io::Error`, so a consumer can tell a transport failure from a refusal.
+#[tokio::test]
+async fn a_failed_read_keeps_the_typed_error_as_its_source() {
+    use tokio::io::AsyncReadExt;
+
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    server.put_object("my-bucket", "a.bin", object_of(1_000));
+
+    let mut reader = client.open_reader("my-bucket", "a.bin").await.unwrap();
+
+    server.push_reply(
+        403,
+        "<Error><Code>AccessDenied</Code><Message>no</Message></Error>",
+    );
+
+    let mut page = [0u8; 64];
+    let err = reader.read_exact(&mut page).await.unwrap_err();
+
+    let s3_error = err
+        .get_ref()
+        .and_then(|err| err.downcast_ref::<my_s3::S3Error>())
+        .expect("the S3Error has to survive as the source");
+
+    assert_eq!(s3_error.get_status_code(), Some(403));
+    assert!(!s3_error.is_retryable());
+
+    // Nothing that identifies the credentials leaks into the rendered message.
+    let rendered = err.to_string();
+    assert!(!rendered.contains(fake_s3::ACCESS_KEY));
+    assert!(!rendered.contains(fake_s3::SECRET_KEY));
+    assert!(!rendered.to_lowercase().contains("signature="));
+}
+
+/// Two readers over the same object are two independent positions.
+#[tokio::test]
+async fn two_readers_do_not_share_a_position() {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    let content = object_of(1_000);
+    server.put_object("my-bucket", "a.bin", content.clone());
+
+    let mut first = client.open_reader("my-bucket", "a.bin").await.unwrap();
+    let mut second = client.open_reader("my-bucket", "a.bin").await.unwrap();
+
+    first.seek(std::io::SeekFrom::Start(10)).await.unwrap();
+    second.seek(std::io::SeekFrom::Start(900)).await.unwrap();
+
+    let mut from_first = [0u8; 8];
+    let mut from_second = [0u8; 8];
+    first.read_exact(&mut from_first).await.unwrap();
+    second.read_exact(&mut from_second).await.unwrap();
+
+    assert_eq!(from_first.as_slice(), &content[10..18]);
+    assert_eq!(from_second.as_slice(), &content[900..908]);
+}
+
+/// `AsyncReadExt` and `AsyncSeekExt` need `Unpin`, and moving a reader onto another
+/// tokio task needs `Send`. Both are load-bearing for the consumer, so they are pinned
+/// here rather than left to be discovered by a compile error somewhere else.
+#[test]
+fn a_reader_is_send_and_unpin() {
+    fn assert_send_and_unpin<T: Send + Unpin>() {}
+
+    assert_send_and_unpin::<my_s3::S3Reader>();
+}
+
+/// And actually move one across a task boundary, which is what a consumer reading pages
+/// in a spawned job does.
+#[tokio::test]
+async fn a_reader_survives_being_moved_to_another_task() {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    let content = object_of(1_000);
+    server.put_object("my-bucket", "a.bin", content.clone());
+
+    let mut reader = client.open_reader("my-bucket", "a.bin").await.unwrap();
+
+    let page = tokio::spawn(async move {
+        reader.seek(std::io::SeekFrom::Start(500)).await.unwrap();
+        let mut page = [0u8; 16];
+        reader.read_exact(&mut page).await.unwrap();
+        page
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(page.as_slice(), &content[500..516]);
+}
+
+/// Seeking out from under a request that is still in flight is refused, loudly. The
+/// bytes on their way belong to an offset that would no longer exist, and silently
+/// dropping the request is the kind of thing that turns into a wrong page much later.
+#[tokio::test]
+async fn seeking_while_a_read_is_in_flight_is_refused() {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    server.put_object("my-bucket", "a.bin", object_of(1_000));
+
+    let mut reader = client.open_reader("my-bucket", "a.bin").await.unwrap();
+
+    // Only now, so the HEAD that opened the reader was not slowed down.
+    server.delay_every_reply(Duration::from_millis(500));
+
+    let mut page = [0u8; 8];
+    let timed_out =
+        tokio::time::timeout(Duration::from_millis(20), reader.read_exact(&mut page)).await;
+    assert!(timed_out.is_err(), "the read had to still be in flight");
+
+    let err = reader.seek(std::io::SeekFrom::Start(0)).await.unwrap_err();
+
+    assert_eq!(err.kind(), std::io::ErrorKind::Other);
+    assert!(err.to_string().contains("in flight"));
+}
+
+/// A read that was cancelled leaves its `GET` in flight. Coming back with a *smaller*
+/// buffer must not lose the rest of the range that was already paid for - and must not
+/// issue a second `GET` for bytes that are already here.
+#[tokio::test]
+async fn a_cancelled_read_is_resumed_without_a_second_get() {
+    use tokio::io::AsyncReadExt;
+
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    let content = object_of(1_000);
+    server.put_object("my-bucket", "a.bin", content.clone());
+
+    let mut reader = client.open_reader("my-bucket", "a.bin").await.unwrap();
+
+    server.delay_every_reply(Duration::from_millis(500));
+
+    // Asks for 16 bytes, then gives up waiting - the GET for bytes=0-15 stays in flight.
+    let mut wide = [0u8; 16];
+    let timed_out =
+        tokio::time::timeout(Duration::from_millis(20), reader.read_exact(&mut wide)).await;
+    assert!(timed_out.is_err());
+
+    server.delay_every_reply(Duration::ZERO);
+
+    // Half the buffer this time. The other half of the answer has to be kept, not
+    // dropped.
+    let mut first = [0u8; 8];
+    reader.read_exact(&mut first).await.unwrap();
+    assert_eq!(first.as_slice(), &content[..8]);
+
+    let mut second = [0u8; 8];
+    reader.read_exact(&mut second).await.unwrap();
+    assert_eq!(second.as_slice(), &content[8..16]);
+
+    assert_eq!(reader.position(), 16);
+
+    // The HEAD, and the single GET that was started before the cancellation.
+    assert_eq!(server.request_count(), 2);
+    assert_eq!(server.captured()[1].header("range"), Some("bytes=0-15"));
+}

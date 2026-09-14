@@ -7,8 +7,10 @@ between calls.
 
 It covers what a service actually does with object storage: put an object, get it back,
 delete it, list a bucket, and make sure the bucket is there. Objects larger than memory
-have a streaming path in both directions. It is deliberately not an SDK — there is no
-versioning, no ACLs, no lifecycle, no presigning.
+have a streaming path in both directions, and an object can also be read as a seekable
+source — `AsyncRead + AsyncSeek`, so code written against `tokio::fs::File` works
+unchanged. It is deliberately not an SDK — there is no versioning, no ACLs, no lifecycle,
+no presigning.
 
 ## Adding it
 
@@ -172,6 +174,63 @@ s3.delete_file("my-bucket", "config.json").await?;
 ```
 
 Deleting is idempotent — a key that was not there is a success, not `KeyNotFound`.
+
+## Reading an object like a file
+
+`open_reader` hands back an `S3Reader`, which implements `tokio::io::AsyncRead` and
+`tokio::io::AsyncSeek`. Code written against `tokio::fs::File` — seek to an offset, read
+a fixed-size page — reads an object out of S3 unchanged.
+
+```rust
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+let mut reader = s3.open_reader("my-bucket", "index.dat").await?;
+
+let mut page = vec![0u8; 16 * 1024];
+reader.seek(std::io::SeekFrom::Start(4 * 16 * 1024)).await?;
+reader.read_exact(&mut page).await?;
+```
+
+Opening costs **one `HEAD`**, for the size — `get_object_size` is the same call on its
+own. After that:
+
+- **Seeking is free.** It moves a number and makes no request. `Start`, `Current` and
+  `End` all work, since the size is known. Seeking past the end is allowed, exactly as
+  it is on a file; reading there returns nothing.
+- **Each read is exactly one ranged `GET`**, for `min(what you asked for, what is left)`
+  bytes. Nothing is read ahead and nothing is cached, so a `read_exact` of a 16 KiB page
+  is one `GET` of 16 KiB, and the object is never held in memory whatever its size.
+
+That last point cuts both ways: this is the shape for reading *pages* out of a large
+object, not for reading one front to back in small pieces — that would be one request
+per piece. Use `download_file_as_stream` for that.
+
+A reader is a single position with one request in flight, like a file handle. To read
+two places at once, open two readers — another `HEAD` each, and then fully independent.
+Both are `Send + Unpin`, so they move onto other tokio tasks.
+
+**A key that is not there fails at `open_reader`**, as `S3Error::KeyNotFound`, rather
+than at the first read — "there is no such object" is an ordinary answer to opening one,
+and a consumer should not have to dig it out of an `io::Error`.
+
+**A short answer is an error, never a short read.** A body that delivers less than the
+range it acknowledged comes back as `io::ErrorKind::UnexpectedEof`, and a server that
+ignores `Range` and returns the whole object is an error too. A caller that asked for a
+page and silently got half of one would parse the half as though it were the page.
+
+Once reading, failures arrive as `io::Error`, because that is what the traits return —
+but the typed error survives as the source:
+
+```rust
+if let Some(err) = err.get_ref().and_then(|err| err.downcast_ref::<my_s3::S3Error>()) {
+    if err.is_retryable() {
+        // a transport failure, not a refusal
+    }
+}
+```
+
+`KeyNotFound` is the one that is mapped rather than wrapped: it becomes
+`io::ErrorKind::NotFound`, the same answer a missing file gives.
 
 ## Listing a bucket
 

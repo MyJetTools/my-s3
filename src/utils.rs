@@ -359,10 +359,7 @@ mod tests {
     /// empty listing *and* a signature mismatch at the same time.
     #[test]
     fn a_folder_prefix_is_encoded_the_way_sigv4_reads_it() {
-        assert_eq!(
-            encode("photos/2024 summer/"),
-            "photos%2F2024%20summer%2F"
-        );
+        assert_eq!(encode("photos/2024 summer/"), "photos%2F2024%20summer%2F");
     }
 
     /// A continuation token is base64 and therefore carries `+`, `/` and `=` - the three

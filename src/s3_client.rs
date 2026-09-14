@@ -4,7 +4,9 @@ use flurl::FlUrlResponse;
 use my_http_client::RequestBodyStream;
 use tokio::sync::mpsc::Receiver;
 
-use super::{S3DownloadStream, S3Error, S3ListObjectsPage, S3ListObjectsRequest, S3Region};
+use super::{
+    S3DownloadStream, S3Error, S3ListObjectsPage, S3ListObjectsRequest, S3Reader, S3Region,
+};
 
 /// `x-amz-content-sha256` value that tells S3 the payload is not covered by the
 /// signature. Required for a streamed body: the header has to be signed before the
@@ -20,6 +22,10 @@ const DEBUG_PREFIX: &str = "[my-s3]";
 /// leaves the value type unresolved. This names it once instead of at every call site.
 const NO_VALUE: Option<&str> = None;
 
+/// `Clone` because [`Self::open_reader`] hands one to every [`S3Reader`]: the ranged
+/// `GET`s a reader issues are `'static` futures, so they cannot borrow the client they
+/// came from. The clone is four owned fields, paid once per reader, never per read.
+#[derive(Clone)]
 pub struct S3Client {
     pub access_key: String,
     pub secret_key: String,
@@ -677,6 +683,93 @@ impl S3Client {
         self.trace_response(status_code, None);
 
         Ok(S3DownloadStream::from_response(response))
+    }
+
+    /// An object's size, without downloading it - `HEAD /{bucket}/{key}`, read out of
+    /// `Content-Length`.
+    ///
+    /// A key that is not there is [`S3Error::KeyNotFound`], the same answer a `GET` for
+    /// it gives. The answer to a `HEAD` carries **no body**, so there is no
+    /// `<Error><Code>` to type a failure from and the status code is all there is - a
+    /// bare `404` is therefore read as the missing key it almost always is.
+    ///
+    /// ```no_run
+    /// # async fn doc(s3: &my_s3::S3Client) -> Result<(), my_s3::S3Error> {
+    /// let size = s3.get_object_size("my-bucket", "video.mp4").await?;
+    /// # let _ = size;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_object_size(&self, bucket_name: &str, key: &str) -> Result<u64, S3Error> {
+        let fl_url = flurl::FlUrl::new(self.endpoint.as_str())
+            .append_path_segment(bucket_name)
+            .append_path_segment(key)
+            .with_retries(3);
+
+        let fl_url = super::utils::sign_request(self, fl_url, "HEAD", [].as_slice())?;
+
+        let response = self.send_head(fl_url).await?;
+
+        let status_code = response.get_status_code();
+
+        // Nothing to read: a HEAD answer has no body by definition.
+        self.trace_response(status_code, None);
+
+        if !is_success(status_code) {
+            return Err(detect_error(status_code, &[]));
+        }
+
+        // Case-insensitively: HTTP header names are, and an S3-compatible storage is
+        // free to answer `Content-Length` or `content-length`.
+        let content_length = response
+            .get_header_case_insensitive("content-length")
+            .ok()
+            .flatten()
+            .and_then(|value| value.trim().parse::<u64>().ok());
+
+        match content_length {
+            Some(content_length) => Ok(content_length),
+            // Guessing zero here would report every object as empty, and a reader built
+            // on that would hand back nothing while looking perfectly healthy.
+            None => Err(S3Error::Other(format!(
+                "HEAD {}/{} answered {} without a usable Content-Length",
+                bucket_name, key, status_code
+            ))),
+        }
+    }
+
+    /// Opens an object as a seekable source - `tokio::io::AsyncRead` +
+    /// `tokio::io::AsyncSeek` - so that code written against `tokio::fs::File` reads it
+    /// unchanged.
+    ///
+    /// This costs **one `HEAD`**, for the size. A key that is not there fails *here*,
+    /// as [`S3Error::KeyNotFound`], rather than at the first read: "there is no such
+    /// object" is an ordinary answer to opening one, and a consumer should not have to
+    /// dig it out of an `io::Error` to find that out.
+    ///
+    /// Everything about what the reads then cost is on [`S3Reader`].
+    ///
+    /// ```no_run
+    /// # async fn doc(s3: &my_s3::S3Client) -> Result<(), Box<dyn std::error::Error>> {
+    /// use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    ///
+    /// let mut reader = s3.open_reader("my-bucket", "index.dat").await?;
+    ///
+    /// let mut page = vec![0u8; 16 * 1024];
+    /// reader.seek(std::io::SeekFrom::Start(64 * 1024)).await?;
+    /// reader.read_exact(&mut page).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn open_reader(&self, bucket_name: &str, key: &str) -> Result<S3Reader, S3Error> {
+        let size = self.get_object_size(bucket_name, key).await?;
+
+        Ok(S3Reader::new(
+            std::sync::Arc::new(self.clone()),
+            bucket_name.to_string(),
+            key.to_string(),
+            size,
+        ))
     }
 
     /// [`Self::create_bucket`], but a bucket that is **already ours** is success rather

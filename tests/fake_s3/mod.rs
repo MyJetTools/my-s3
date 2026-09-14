@@ -6,8 +6,9 @@
 //! its own code rather than calling into `my_s3` - a test that shares the
 //! implementation would agree with any bug in it.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
@@ -60,9 +61,19 @@ struct Reply {
 }
 
 struct State {
-    /// Replies to hand out in order; an empty queue means "200 with no body".
+    /// Replies to hand out in order. They take precedence over [`State::objects`], so a
+    /// test can still inject whatever answer it wants at any point.
     replies: Mutex<VecDeque<Reply>>,
     captured: Mutex<Vec<Captured>>,
+    /// Objects this server actually holds, keyed by request path (`/bucket/key`).
+    ///
+    /// Empty unless a test called [`FakeS3::put_object`], and that is what keeps the
+    /// default behaviour - "200 with no body" - the same for every test that does not
+    /// use it.
+    objects: Mutex<HashMap<String, Vec<u8>>>,
+    /// How long to sit on every answer before writing it, so a test can observe a
+    /// request that is genuinely still in flight rather than racing the loopback.
+    delay: Mutex<Option<Duration>>,
 }
 
 pub struct FakeS3 {
@@ -78,6 +89,8 @@ impl FakeS3 {
         let state = Arc::new(State {
             replies: Mutex::new(VecDeque::new()),
             captured: Mutex::new(Vec::new()),
+            objects: Mutex::new(HashMap::new()),
+            delay: Mutex::new(None),
         });
 
         let accept_state = state.clone();
@@ -121,6 +134,29 @@ impl FakeS3 {
             body: body.to_string(),
             lie_about_length: Some(declared_length),
         });
+    }
+
+    /// Stores an object, so that `HEAD` reports its size and `GET` serves it - honouring
+    /// `Range`. Without this the server answers from the reply queue alone, which is
+    /// enough to check what a request looked like but not that the *right bytes* came
+    /// back.
+    ///
+    /// Queued replies still win, so error injection keeps working on a served object.
+    pub fn put_object(&self, bucket_name: &str, key: &str, content: Vec<u8>) {
+        self.state
+            .objects
+            .lock()
+            .unwrap()
+            .insert(format!("/{}/{}", bucket_name, key), content);
+    }
+
+    /// Makes every subsequent answer wait `delay` before it is written.
+    ///
+    /// This is what makes "a request is still in flight" a fact rather than a race: a
+    /// test can start a read, let it time out, and know the `GET` has not been answered.
+    /// `Duration::ZERO` turns it off again.
+    pub fn delay_every_reply(&self, delay: Duration) {
+        *self.state.delay.lock().unwrap() = if delay.is_zero() { None } else { Some(delay) };
     }
 
     pub fn captured(&self) -> Vec<Captured> {
@@ -211,35 +247,189 @@ async fn serve_connection(
 
         let answering_a_head = method.eq_ignore_ascii_case("HEAD");
 
+        // Read off before `headers` is moved into the capture.
+        let range = headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("range"))
+            .map(|(_, value)| value.clone());
+
         state.captured.lock().unwrap().push(Captured {
-            method,
-            target,
+            method: method.clone(),
+            target: target.clone(),
             headers,
             body,
             signature_valid,
         });
 
-        let reply = state.replies.lock().unwrap().pop_front().unwrap_or(Reply {
-            status_code: 200,
-            body: String::new(),
-            lie_about_length: None,
-        });
+        // A queued reply first: a test that injected one is testing that answer, even
+        // for a path this server holds an object for.
+        let queued = state.replies.lock().unwrap().pop_front();
 
-        write_response(
-            &mut stream,
-            reply.status_code,
-            &reply.body,
-            answering_a_head,
-            reply.lie_about_length,
-        )
-        .await?;
+        let response = match queued {
+            Some(reply) => Response::from(reply),
+            None => serve_from_objects(&state, &method, &target, range.as_deref())
+                .unwrap_or_else(Response::empty_ok),
+        };
+
+        let lied_about_length = response.lie_about_length.is_some();
+
+        // Copied out of the mutex before awaiting: a `MutexGuard` is not `Send` and must
+        // not be held across an await point.
+        let delay = *state.delay.lock().unwrap();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+
+        write_response(&mut stream, &response, answering_a_head).await?;
 
         // The half-sent body is only a truncation if the connection then ends; keeping
         // it open would just look like a slow server.
-        if reply.lie_about_length.is_some() {
+        if lied_about_length {
             return Ok(());
         }
     }
+}
+
+/// What actually goes back on the wire.
+struct Response {
+    status_code: u16,
+    body: Vec<u8>,
+    content_type: &'static str,
+    /// Header lines beyond the framing ones - `Content-Range` for a `206`.
+    extra_headers: Vec<(String, String)>,
+    lie_about_length: Option<usize>,
+}
+
+impl Response {
+    /// The default when nothing was queued and no object matched: what this server
+    /// answered before it could hold objects at all.
+    fn empty_ok() -> Self {
+        Self {
+            status_code: 200,
+            body: Vec::new(),
+            content_type: "application/xml",
+            extra_headers: Vec::new(),
+            lie_about_length: None,
+        }
+    }
+}
+
+impl From<Reply> for Response {
+    fn from(reply: Reply) -> Self {
+        Self {
+            status_code: reply.status_code,
+            body: reply.body.into_bytes(),
+            content_type: "application/xml",
+            extra_headers: Vec::new(),
+            lie_about_length: reply.lie_about_length,
+        }
+    }
+}
+
+/// Answers a `GET`/`HEAD` out of [`State::objects`], or `None` to fall through to the
+/// default answer.
+///
+/// `None` - rather than a 404 - while the store is empty is what keeps every test that
+/// never calls [`FakeS3::put_object`] behaving exactly as it did before.
+fn serve_from_objects(
+    state: &State,
+    method: &str,
+    target: &str,
+    range: Option<&str>,
+) -> Option<Response> {
+    if !method.eq_ignore_ascii_case("GET") && !method.eq_ignore_ascii_case("HEAD") {
+        return None;
+    }
+
+    let objects = state.objects.lock().unwrap();
+
+    if objects.is_empty() {
+        return None;
+    }
+
+    // A subresource (`?location`, `?list-type=2`) is not a request for the object.
+    let path = match target.split_once('?') {
+        Some((path, _)) => path,
+        None => target,
+    };
+
+    let Some(content) = objects.get(path) else {
+        return Some(Response {
+            status_code: 404,
+            body: NO_SUCH_KEY.as_bytes().to_vec(),
+            content_type: "application/xml",
+            extra_headers: Vec::new(),
+            lie_about_length: None,
+        });
+    };
+
+    let length = content.len() as u64;
+
+    // No `Range`: the whole object. For a HEAD the body is dropped, so this is also what
+    // makes `Content-Length` the object's real size.
+    let Some(range) = range else {
+        return Some(Response {
+            status_code: 200,
+            body: content.clone(),
+            content_type: "application/octet-stream",
+            extra_headers: Vec::new(),
+            lie_about_length: None,
+        });
+    };
+
+    let Some((start, end)) = parse_range(range, length) else {
+        return Some(Response {
+            status_code: 416,
+            body: INVALID_RANGE.as_bytes().to_vec(),
+            content_type: "application/xml",
+            extra_headers: Vec::new(),
+            lie_about_length: None,
+        });
+    };
+
+    Some(Response {
+        status_code: 206,
+        body: content[start as usize..=end as usize].to_vec(),
+        content_type: "application/octet-stream",
+        extra_headers: vec![(
+            "Content-Range".to_string(),
+            format!("bytes {}-{}/{}", start, end, length),
+        )],
+        lie_about_length: None,
+    })
+}
+
+const NO_SUCH_KEY: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message></Error>";
+
+const INVALID_RANGE: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>InvalidRange</Code><Message>The requested range is not satisfiable</Message></Error>";
+
+/// `bytes=<first>-<last>` and `bytes=<first>-`, resolved against the object's length and
+/// clamped to it. `None` means unsatisfiable - a `416`.
+///
+/// Suffix ranges (`bytes=-500`) are deliberately not supported: this crate never sends
+/// one, and accepting a form the client cannot produce would only hide it if it started
+/// to.
+fn parse_range(value: &str, length: u64) -> Option<(u64, u64)> {
+    let spec = value.trim().strip_prefix("bytes=")?;
+    let (first, last) = spec.split_once('-')?;
+
+    let start: u64 = first.trim().parse().ok()?;
+
+    // A first byte at or past the end is the one case a real S3 answers 416 for.
+    if start >= length {
+        return None;
+    }
+
+    let end = match last.trim() {
+        "" => length - 1,
+        last => last.parse::<u64>().ok()?.min(length - 1),
+    };
+
+    if end < start {
+        return None;
+    }
+
+    Some((start, end))
 }
 
 async fn read_chunked_body(
@@ -302,11 +492,11 @@ async fn read_chunked_body(
 
 async fn write_response(
     stream: &mut tokio::net::TcpStream,
-    status_code: u16,
-    body: &str,
+    response: &Response,
     answering_a_head: bool,
-    lie_about_length: Option<usize>,
 ) -> std::io::Result<()> {
+    let status_code = response.status_code;
+    let body = response.body.as_slice();
     let reason = match status_code {
         200 => "OK",
         400 => "Bad Request",
@@ -321,24 +511,30 @@ async fn write_response(
         _ => "Unknown",
     };
 
-    // The answer to a HEAD carries the headers of the GET that was not made - including
-    // `Content-Length` - but **no body**. Writing one would be read as the start of the
-    // next response on this keep-alive connection.
-    if let Some(declared_length) = lie_about_length {
-        let response = format!(
-            "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\nConnection: keep-alive\r\n\r\n{}",
-            status_code, reason, declared_length, body
+    let extra: String = response
+        .extra_headers
+        .iter()
+        .map(|(name, value)| format!("{}: {}\r\n", name, value))
+        .collect();
+
+    if let Some(declared_length) = response.lie_about_length {
+        let head = format!(
+            "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nContent-Type: {}\r\n{}Connection: keep-alive\r\n\r\n",
+            status_code, reason, declared_length, response.content_type, extra
         );
-        stream.write_all(response.as_bytes()).await?;
+        stream.write_all(head.as_bytes()).await?;
+        stream.write_all(body).await?;
         return stream.flush().await;
     }
 
-    let response = if answering_a_head {
+    let head = if answering_a_head {
         format!(
-            "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nContent-Type: application/xml\r\nConnection: keep-alive\r\n\r\n",
+            "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nContent-Type: {}\r\n{}Connection: keep-alive\r\n\r\n",
             status_code,
             reason,
-            body.len()
+            body.len(),
+            response.content_type,
+            extra
         )
     } else if status_code == 204 {
         // 204 carries no content at all - not even a zero Content-Length - which is
@@ -346,15 +542,24 @@ async fn write_response(
         format!("HTTP/1.1 204 {}\r\nConnection: keep-alive\r\n\r\n", reason)
     } else {
         format!(
-            "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nContent-Type: application/xml\r\nConnection: keep-alive\r\n\r\n{}",
+            "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nContent-Type: {}\r\n{}Connection: keep-alive\r\n\r\n",
             status_code,
             reason,
             body.len(),
-            body
+            response.content_type,
+            extra
         )
     };
 
-    stream.write_all(response.as_bytes()).await?;
+    stream.write_all(head.as_bytes()).await?;
+
+    // The answer to a HEAD carries the headers of the GET that was not made - including
+    // `Content-Length` - but no body. Writing one would be read as the start of the next
+    // response on this keep-alive connection.
+    if !answering_a_head && status_code != 204 {
+        stream.write_all(body).await?;
+    }
+
     stream.flush().await
 }
 
@@ -460,7 +665,10 @@ pub fn canonical_query(query: &str) -> String {
         .split('&')
         .filter(|pair| !pair.is_empty())
         .map(|pair| match pair.split_once('=') {
-            Some((name, value)) => (uri_encode(&percent_decode(name)), uri_encode(&percent_decode(value))),
+            Some((name, value)) => (
+                uri_encode(&percent_decode(name)),
+                uri_encode(&percent_decode(value)),
+            ),
             None => (uri_encode(&percent_decode(pair)), String::new()),
         })
         .collect();
