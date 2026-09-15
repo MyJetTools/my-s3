@@ -304,6 +304,80 @@ if let Some(err) = err.get_upload_producer_error() {
 }
 ```
 
+### Handing the writer out
+
+`upload_with_writer` keeps the writer inside a closure and the result in its return value,
+which suits one producer writing one object from start to finish. When the writer has to
+go somewhere else — a factory hands it to code that only knows `AsyncWrite`, and the
+question "did it land?" comes up later — `start_upload` gives the two back separately:
+an `S3UploadWriter`, and an `S3UploadHandle` whose `finish()` is the answer.
+
+A multi-file archive is the typical shape: it asks a factory for each file, writes it, ends
+it, and moves on.
+
+```rust
+use std::sync::Mutex;
+use tokio::io::AsyncWriteExt;
+
+struct ArchiveFilesInS3 {
+    s3: my_s3::S3Client,
+    prefix: String,
+    // Collected while the archive is written, finished once it is.
+    uploads: Mutex<Vec<my_s3::S3UploadHandle>>,
+}
+
+impl ArchiveFilesInS3 {
+    async fn create_data_file(&self, no: u8, len: u64) -> std::io::Result<my_s3::S3UploadWriter> {
+        let len = usize::try_from(len).map_err(std::io::Error::other)?;
+        let key = format!("{}.data{:02X}", self.prefix, no);
+
+        let (writer, handle) =
+            self.s3.start_upload("my-bucket", &key, len, Duration::from_secs(600));
+
+        self.uploads.lock().unwrap().push(handle);
+        Ok(writer)
+    }
+}
+
+// The archive writes a file and ends it - it never learns the file is an S3 object.
+let mut file = files.create_data_file(0, bytes.len() as u64).await?;
+file.write_all(&bytes).await?;
+file.shutdown().await?;                  // sends the last chunk and ends the body
+
+// Afterwards - and only then - each object is known to be there.
+let uploads = std::mem::take(&mut *files.uploads.lock().unwrap());
+for upload in uploads {
+    upload.finish().await?;
+}
+```
+
+The writer is the same `S3UploadWriter` as above, with the same rules — the exact length,
+ending with `shutdown` — and a few more that come from the result living elsewhere:
+
+- **Nothing goes out before the first chunk.** The request starts when the writer hands
+  over its first chunk or ends the body, so a writer taken early holds no socket, and
+  `upload_timeout` covers the request itself, not the wait before it. Once started, each
+  upload holds a connection of its own until its answer is read.
+- **`finish` waits for the body to end**, so call it after `shutdown` (or after the writer
+  has been dropped). Awaited while the writer still owes bytes, it waits with it — on the
+  same task, until `upload_timeout` gives up.
+- **`finish` is the only proof.** `shutdown` returning `Ok` means the body was handed over,
+  not that the storage has it.
+- **Dropping the handle cancels the upload**, and the writer's next write fails with
+  `BrokenPipe` — an object nobody waits for does not quietly land. Dropping the handles
+  above on an early `?` cancels whatever has not been answered yet; an upload whose whole
+  body already went out may have landed regardless, so after a drop the object may or may
+  not be there.
+- **Nothing is retried.** When `finish` says `is_retryable()`, call `start_upload` again
+  and write the body from the first byte.
+- `start_upload` runs its request on a spawned task, so it must be called inside a tokio
+  runtime. The writer and the handle are both `Send`, and may live on different tasks.
+
+`finish` settles failures by the same rules as `upload_with_writer`, with one addition: the
+handle knows only how many bytes went out, not why the code writing them stopped. A body
+ended short is `UploadProducerFailed` with `UnexpectedEof`; if the writing failed for a
+reason of its own, that error is the more precise one to keep.
+
 ## Listing a bucket
 
 ```rust
@@ -388,7 +462,8 @@ Predicates: `is_key_not_found`, `is_bucket_not_found`, `is_bucket_already_exists
 `is_upload_producer_failed`.
 
 One variant is not the storage's answer at all: `UploadProducerFailed` is *our* side of
-an `upload_with_writer` — the body could not be produced. `get_upload_producer_error()`
+an `upload_with_writer` or a `start_upload` — the body could not be produced, or was ended
+short. `get_upload_producer_error()`
 hands back the `io::Error` that says why, and it is never retryable, because what has to
 change is local.
 

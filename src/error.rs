@@ -33,12 +33,13 @@ pub enum S3Error {
         body: String,
     },
     /// The producer handed to [`crate::S3Client::upload_with_writer`] failed before it
-    /// had written the whole body.
+    /// had written the whole body - or the writer from [`crate::S3Client::start_upload`]
+    /// was ended with fewer bytes than it declared.
     ///
     /// This is the *source's* failure, not the storage's - a file that could not be
-    /// read, a serializer that gave up - and it is reported in preference to the S3
-    /// error it causes, which is only ever "the body was shorter than `Content-Length`"
-    /// and says nothing about why.
+    /// read, a serializer that gave up, a writer dropped without `shutdown` - and it is
+    /// reported in preference to the S3 error it causes, which is only ever "the body was
+    /// shorter than `Content-Length`" and says nothing about why.
     UploadProducerFailed(std::io::Error),
     Other(String),
 }

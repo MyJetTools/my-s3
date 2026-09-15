@@ -8,7 +8,7 @@ use tokio::sync::mpsc::Receiver;
 use super::upload_writer::{DEFAULT_UPLOAD_CHUNK_SIZE, UploadWriterState};
 use super::{
     S3DownloadStream, S3Error, S3ListObjectsPage, S3ListObjectsRequest, S3Reader, S3Region,
-    S3UploadWriter,
+    S3UploadHandle, S3UploadWriter,
 };
 
 /// `x-amz-content-sha256` value that tells S3 the payload is not covered by the
@@ -27,7 +27,8 @@ const NO_VALUE: Option<&str> = None;
 
 /// `Clone` because [`Self::open_reader`] hands one to every [`S3Reader`]: the ranged
 /// `GET`s a reader issues are `'static` futures, so they cannot borrow the client they
-/// came from. The clone is four owned fields, paid once per reader, never per read.
+/// came from - and so does [`Self::start_upload`], for the task its request runs on. The
+/// clone is a handful of owned fields, paid once per reader or upload, never per read.
 #[derive(Clone)]
 pub struct S3Client {
     pub access_key: String,
@@ -344,6 +345,10 @@ impl S3Client {
     /// The producer runs on a task of its own, so its future is `Send + 'static` - it
     /// owns, or holds an `Arc` of, whatever it reads from.
     ///
+    /// When the writer has to leave the closure - handed out by a factory, written by
+    /// code that returns before the result is needed - use [`Self::start_upload`], which
+    /// gives the writer and the result back separately.
+    ///
     /// # Which error comes back
     ///
     /// When an upload goes wrong, both halves fail - and they report different things,
@@ -411,7 +416,7 @@ impl S3Client {
         // the caller's source and must be finished with it before this returns.
         let produce_result = producing.await;
 
-        finish_upload_with_writer(upload_result, produce_result, &state, content_length)
+        finish_upload_with_writer(upload_result, produce_result, &state)
     }
 
     /// [`Self::upload_with_writer`] with the retry loop, on the same terms as
@@ -488,6 +493,137 @@ impl S3Client {
 
             retries += 1;
         }
+    }
+
+    /// Starts one streamed `PUT` and returns at once: the writer for its body, and the
+    /// handle to its result.
+    ///
+    /// This is [`Self::upload_with_writer`] taken apart. That call keeps the writer inside
+    /// a closure and the result in its own return value, which suits a producer that
+    /// writes one object from start to finish. Here the writer is an ordinary value - hand
+    /// it to a factory, to code that only knows `AsyncWrite`, to another task - and
+    /// [`S3UploadHandle::finish`] answers whether the object was stored, whenever that
+    /// question comes up.
+    ///
+    /// Underneath it is still [`Self::upload_streamed`], on a task of its own: the same
+    /// bounded channel, the same single request, the same few MiB of peak memory.
+    ///
+    /// # Nothing goes out before the first chunk
+    ///
+    /// The request - the connection, the signed head - is started when the writer hands
+    /// over its first chunk or ends the body, not when this returns. A writer taken early
+    /// and written late holds no socket in the meantime, and `upload_timeout` is not
+    /// running: it covers the request, from the first chunk to the storage's answer.
+    ///
+    /// Once started, an upload holds one connection of its own until the answer is read.
+    /// A thousand writers written at once are a thousand sockets.
+    ///
+    /// # The rules
+    ///
+    /// - **`content_length` must be exact**, for the reasons [`Self::upload_streamed`]
+    ///   spells out. The writer refuses the byte past it with
+    ///   [`std::io::ErrorKind::InvalidInput`], and never sends it.
+    /// - **End the body with `shutdown`.** It sends the last partial chunk. Dropping the
+    ///   writer also ends the body, without sending it - and `finish` then reports
+    ///   "only N of M bytes went out".
+    /// - **Call `finish` after the body has ended.** It waits for the body; see
+    ///   [`S3UploadHandle::finish`].
+    /// - **Dropping the handle cancels the upload**, and the writer's next write fails with
+    ///   [`std::io::ErrorKind::BrokenPipe`]. An object nobody waits for does not quietly
+    ///   land - with the one caveat [`S3UploadHandle`] spells out for a body that already
+    ///   went out whole.
+    /// - **Nothing is retried.** A streamed body cannot be sent twice. When `finish` says
+    ///   [`S3Error::is_retryable`], call this again and write the body from the first
+    ///   byte.
+    ///
+    /// # Must be called inside a tokio runtime
+    ///
+    /// The upload runs on a spawned task, so this panics outside one, with a message that
+    /// says so. A runtime that is shutting down cancels the task instead: the writer sees
+    /// `BrokenPipe`, and `finish` reports the task that did not finish.
+    ///
+    /// ```no_run
+    /// # use std::time::Duration;
+    /// # async fn doc(s3: &my_s3::S3Client, index: Vec<u8>)
+    /// # -> Result<(), Box<dyn std::error::Error>> {
+    /// use tokio::io::AsyncWriteExt;
+    ///
+    /// let (mut writer, handle) = s3.start_upload(
+    ///     "my-bucket",
+    ///     "archives/2024/backup.index",
+    ///     index.len(),
+    ///     Duration::from_secs(600),
+    /// );
+    ///
+    /// // Whatever the writer is handed to never learns it is writing to S3.
+    /// let written = async {
+    ///     writer.write_all(&index).await?;
+    ///     // Sends the last chunk and ends the body.
+    ///     writer.shutdown().await
+    /// }
+    /// .await;
+    ///
+    /// // Ends the body if the writing stopped half-way; `finish` waits for that.
+    /// drop(writer);
+    ///
+    /// // The upload's answer first: a writer that saw `BrokenPipe` was only told that the
+    /// // upload died, and `finish` says why.
+    /// handle.finish().await?;
+    /// written?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn start_upload(
+        &self,
+        bucket_name: &str,
+        key: &str,
+        content_length: usize,
+        upload_timeout: Duration,
+    ) -> (S3UploadWriter, S3UploadHandle) {
+        // `tokio::spawn` would panic here too, but with "there is no reactor running"
+        // from three frames down, which does not say whose rule was broken.
+        let runtime = tokio::runtime::Handle::try_current()
+            .expect("S3Client::start_upload must be called from inside a tokio runtime");
+
+        let (writer, body, state) =
+            S3UploadWriter::new(bucket_name, key, content_length, DEFAULT_UPLOAD_CHUNK_SIZE);
+
+        // Owned copies: the task outlives every borrow this call was given.
+        let client = self.clone();
+        let task_bucket_name = bucket_name.to_string();
+        let task_key = key.to_string();
+        let task_state = state.clone();
+
+        let upload = runtime.spawn(async move {
+            // Nothing has touched the network yet, and nothing will until the writer has
+            // something for the request to carry.
+            task_state.body_started().await;
+
+            // A body that has already ended short is final: `sent` cannot grow once the
+            // `Sender` is gone. Opening a connection only to have the storage refuse it
+            // would change nothing but the cost - `finish` reports the short body either
+            // way, and this error is never what it surfaces.
+            if task_state.body_ended() && task_state.short_body_error().is_some() {
+                return Err(S3Error::Other(format!(
+                    "the body of {}/{} ended short before its request was started",
+                    task_bucket_name, task_key
+                )));
+            }
+
+            client
+                .upload_streamed(
+                    task_bucket_name.as_str(),
+                    task_key.as_str(),
+                    body,
+                    content_length,
+                    upload_timeout,
+                )
+                .await
+        });
+
+        let handle = S3UploadHandle::new(upload, state, bucket_name, key);
+
+        (writer, handle)
     }
 
     pub async fn download_file(&self, bucket_name: &str, key: &str) -> Result<Vec<u8>, S3Error> {
@@ -1094,27 +1230,16 @@ impl S3Client {
 
 /// Decides which of two failures the caller of [`S3Client::upload_with_writer`] sees.
 ///
-/// An upload written through a writer has two halves that fail *together*: kill either
-/// one and the other stops right after, with an error that describes the wreckage rather
-/// than the cause. So the rule is about order, not about which error looks worse:
-///
-/// > If the writer saw the channel close under it, the upload died first and everything
-/// > the producer reports is downstream of that - the S3 error is the one that explains
-/// > the failure. Otherwise the producer failed on its own, and the S3 error is only
-/// > "the body was shorter than `Content-Length`", which explains nothing.
-///
-/// A producer that returns `Ok` having delivered less than it declared is a failure of
-/// the same kind, and is caught here rather than left to the storage: the storage would
-/// report it as a malformed request, or - with an unlucky server - not at all. Delivery
-/// is measured by what reached the channel, not by what went into the writer - a partial
-/// chunk left buffered by a producer that never called `shutdown` went nowhere.
+/// The rule itself is [`UploadWriterState::settle`], shared with
+/// [`crate::S3UploadHandle::finish`] so the two paths cannot drift. What is particular to
+/// this one is the producer: it has been awaited before this runs, so its own error - or
+/// its panic - is known, and so is every byte it will ever deliver.
 fn finish_upload_with_writer(
     upload_result: Result<(), S3Error>,
     produce_result: Result<std::io::Result<()>, tokio::task::JoinError>,
     state: &UploadWriterState,
-    content_length: usize,
 ) -> Result<(), S3Error> {
-    let producer_failure = match produce_result {
+    let body_failure = match produce_result {
         // A panic (or a cancelled task) is never a success, and the panic message has
         // already gone to stderr where a panic belongs.
         Err(join_error) => Some(std::io::Error::other(format!(
@@ -1124,40 +1249,12 @@ fn finish_upload_with_writer(
 
         Ok(Err(err)) => Some(err),
 
-        Ok(Ok(())) => {
-            let delivered = state.sent();
-
-            if delivered < content_length as u64 {
-                Some(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    format!(
-                        "the upload body producer reported success but only {} of the {} bytes it declared went out - either the source ended early, or a missing shutdown() left the last partial chunk unsent",
-                        delivered, content_length
-                    ),
-                ))
-            } else {
-                None
-            }
-        }
+        // Returning `Ok` is not delivering: a source that ended early, or a missing
+        // `shutdown` that left the last partial chunk in the writer, both land here.
+        Ok(Ok(())) => state.short_body_error(),
     };
 
-    match (upload_result, producer_failure) {
-        (Ok(()), None) => Ok(()),
-
-        // The storage accepted a body the producer did not finish. Whether a server can
-        // actually answer this way or not, it is not something to return as success.
-        (Ok(()), Some(err)) => Err(S3Error::UploadProducerFailed(err)),
-
-        (Err(err), None) => Err(err),
-
-        (Err(s3_error), Some(producer_error)) => {
-            if state.upload_ended() {
-                Err(s3_error)
-            } else {
-                Err(S3Error::UploadProducerFailed(producer_error))
-            }
-        }
-    }
+    state.settle(upload_result, body_failure)
 }
 
 /// A failure is printed in full: that body is the `<Error><Code>` saying why, and it is

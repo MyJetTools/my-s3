@@ -7,6 +7,7 @@
 //! implementation would agree with any bug in it.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -91,7 +92,25 @@ struct State {
     /// request dies while the client is still writing it, so the producer finds out
     /// through its writer rather than through the upload's return value.
     abort_after: Mutex<Option<usize>>,
+    /// Bytes to accept of the next request body before answering it - early, while the
+    /// client is still writing - and then hanging up.
+    ///
+    /// That is how a storage refuses an upload half-way (a 500, a quota): the answer is on
+    /// the wire before the body is, and the connection goes with it.
+    answer_after: Mutex<Option<(usize, Reply)>>,
+    /// Connections this server has accepted. `captured` only grows once a body has been
+    /// read, so it cannot tell "no request was ever started" from "one is in flight";
+    /// this can.
+    connections_accepted: AtomicUsize,
 }
+
+/// How long an early answer is left on an open connection before hanging up.
+///
+/// Closing a socket that still has unread request bytes in it resets the connection, and
+/// a reset can take the answer that was just written with it. So the answer is given time
+/// to be read first. Nothing more is read meanwhile, so the client cannot use the pause to
+/// finish its body.
+const EARLY_ANSWER_LINGER: Duration = Duration::from_millis(200);
 
 pub struct FakeS3 {
     pub endpoint: String,
@@ -110,6 +129,8 @@ impl FakeS3 {
             delay: Mutex::new(None),
             uploaded: Mutex::new(HashMap::new()),
             abort_after: Mutex::new(None),
+            answer_after: Mutex::new(None),
+            connections_accepted: AtomicUsize::new(0),
         });
 
         let accept_state = state.clone();
@@ -118,6 +139,10 @@ impl FakeS3 {
                 let Ok((stream, _)) = listener.accept().await else {
                     return;
                 };
+
+                accept_state
+                    .connections_accepted
+                    .fetch_add(1, Ordering::AcqRel);
 
                 let connection_state = accept_state.clone();
                 tokio::spawn(async move {
@@ -203,6 +228,30 @@ impl FakeS3 {
         *self.state.abort_after.lock().unwrap() = Some(after_bytes);
     }
 
+    /// Makes the **next** request be answered with `status_code` and `body` after
+    /// `after_bytes` of its body have been read - while the client is still writing it -
+    /// and the connection then closed.
+    ///
+    /// The storage refusing an upload half-way. Unlike
+    /// [`Self::abort_next_request_after`] the client does get an answer, so the error it
+    /// reports is that answer, not a broken connection.
+    pub fn answer_next_request_after(&self, after_bytes: usize, status_code: u16, body: &str) {
+        *self.state.answer_after.lock().unwrap() = Some((
+            after_bytes,
+            Reply {
+                status_code,
+                body: body.to_string(),
+                lie_about_length: None,
+            },
+        ));
+    }
+
+    /// How many connections have been accepted so far - including ones whose request has
+    /// not been read yet.
+    pub fn connections_accepted(&self) -> usize {
+        self.state.connections_accepted.load(Ordering::Acquire)
+    }
+
     pub fn captured(&self) -> Vec<Captured> {
         self.state.captured.lock().unwrap().clone()
     }
@@ -275,11 +324,16 @@ async fn serve_connection(
         // Armed once, consumed once: a retry test arms it for the first attempt and the
         // second attempt must be served normally.
         let abort_after = state.abort_after.lock().unwrap().take();
+        let answer_after = state.answer_after.lock().unwrap().take();
+
+        let cut_after = abort_after.or(answer_after
+            .as_ref()
+            .map(|(after_bytes, _)| *after_bytes));
 
         let body: Vec<u8> = if is_chunked {
             read_chunked_body(&mut stream, &mut buffer).await?
         } else {
-            let wanted = match abort_after {
+            let wanted = match cut_after {
                 Some(after_bytes) => content_length.min(after_bytes),
                 None => content_length,
             };
@@ -320,6 +374,14 @@ async fn serve_connection(
         // Dropping the stream here is the hang-up: no status line, no answer, in the
         // middle of a request the client is still writing.
         if abort_after.is_some() {
+            return Ok(());
+        }
+
+        // Answered before the body is in, then hung up. Nothing is stored: the request
+        // was refused, whatever part of it arrived.
+        if let Some((_, reply)) = answer_after {
+            write_response(&mut stream, &Response::from(reply), answering_a_head).await?;
+            tokio::time::sleep(EARLY_ANSWER_LINGER).await;
             return Ok(());
         }
 
@@ -584,6 +646,7 @@ async fn write_response(
         409 => "Conflict",
         416 => "Range Not Satisfiable",
         429 => "Too Many Requests",
+        500 => "Internal Server Error",
         503 => "Service Unavailable",
         _ => "Unknown",
     };

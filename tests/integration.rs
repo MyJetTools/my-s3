@@ -335,8 +335,9 @@ fn pattern(length: usize) -> Vec<u8> {
 }
 
 /// A writer is only useful to a producer that can move it onto another task, which is
-/// exactly what `upload_with_writer` does to it. `Unpin` is what lets `write_all` and
-/// `tokio::io::copy` take it by `&mut` without pinning it first.
+/// exactly what `upload_with_writer` does to it - and what a factory handing out writers
+/// from `start_upload` does. `Unpin` is what lets `write_all` and `tokio::io::copy` take it
+/// by `&mut` without pinning it first.
 #[test]
 fn the_writer_is_send_and_unpin() {
     fn assert_send_and_unpin<T: Send + Unpin>() {}
@@ -958,6 +959,609 @@ async fn a_producer_that_panics_is_never_a_success() {
         server.uploaded_object("my-bucket", "archives/panicked.bin"),
         None
     );
+}
+
+// ---------------------------------------------------------------------------
+// Starting an upload and finishing it later
+// ---------------------------------------------------------------------------
+
+/// Writes into `writer` until it refuses a write, and hands back that refusal.
+///
+/// Used where the upload is expected to go away under the writer. How many writes that
+/// takes is not a number to assert on - the upload keeps draining the channel until it
+/// finds out - so the loop is bounded by the object's length, and running out of it
+/// without a refusal fails the test.
+async fn write_until_refused(writer: &mut my_s3::S3UploadWriter) -> std::io::Error {
+    let piece = vec![9u8; 64 * 1024];
+
+    while writer.bytes_written() < writer.content_length() {
+        let owed = writer.content_length() - writer.bytes_written();
+        let take = owed.min(piece.len() as u64) as usize;
+
+        if let Err(err) = writer.write_all(&piece[..take]).await {
+            return err;
+        }
+    }
+
+    panic!("every byte was accepted - the upload never went away under the writer")
+}
+
+/// The shape the whole thing exists for: the writer is an ordinary value, and the answer
+/// comes from somewhere else, later.
+#[tokio::test]
+async fn a_started_upload_delivers_the_object_and_finish_reports_it() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    // Several chunks, and not a multiple of the chunk size or of the write size.
+    let content = pattern(1_500_000);
+
+    let (mut writer, handle) = client.start_upload(
+        "my-bucket",
+        "archives/started.bin",
+        content.len(),
+        UPLOAD_TIMEOUT,
+    );
+
+    for piece in content.chunks(7_000) {
+        writer.write_all(piece).await.unwrap();
+    }
+    writer.shutdown().await.unwrap();
+
+    handle.finish().await.unwrap();
+
+    assert_eq!(
+        server.uploaded_object("my-bucket", "archives/started.bin"),
+        Some(content.clone())
+    );
+
+    let captured = server.captured();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].method, "PUT");
+    assert_eq!(
+        captured[0].header("content-length"),
+        Some(content.len().to_string().as_str())
+    );
+    assert!(captured[0].signature_valid);
+}
+
+/// An empty object is still one request: the body ends before it has a chunk, and ending
+/// it is what starts the request.
+#[tokio::test]
+async fn a_started_upload_of_zero_bytes_is_one_empty_put() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    let (mut writer, handle) =
+        client.start_upload("my-bucket", "archives/empty.bin", 0, UPLOAD_TIMEOUT);
+
+    writer.shutdown().await.unwrap();
+    handle.finish().await.unwrap();
+
+    let captured = server.captured();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].header("content-length"), Some("0"));
+    assert!(captured[0].body_complete);
+
+    assert_eq!(
+        server.uploaded_object("my-bucket", "archives/empty.bin"),
+        Some(Vec::new())
+    );
+}
+
+/// Ended with `shutdown`, but short of what was declared. Never a success - and a body
+/// already known to be short does not cost a request the storage would only refuse.
+#[tokio::test]
+async fn a_started_upload_that_stops_short_is_never_a_success() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    let (mut writer, handle) =
+        client.start_upload("my-bucket", "archives/short.bin", 1_000, UPLOAD_TIMEOUT);
+
+    writer.write_all(&pattern(400)).await.unwrap();
+    writer.shutdown().await.unwrap();
+
+    let err = handle.finish().await.unwrap_err();
+
+    let io_error = err
+        .get_upload_producer_error()
+        .expect("a body ended short is the writer's failure, not the storage's");
+
+    assert_eq!(io_error.kind(), std::io::ErrorKind::UnexpectedEof);
+    assert!(
+        io_error.to_string().contains("only 400 of the 1000"),
+        "the error has to say how far it got, got: {}",
+        io_error
+    );
+    assert!(!err.is_retryable());
+
+    // Deterministic on the single-threaded test runtime: nothing above yields, so the
+    // upload task first runs inside `finish`, when the body has already ended short.
+    assert_eq!(server.request_count(), 0);
+    assert_eq!(
+        server.uploaded_object("my-bucket", "archives/short.bin"),
+        None
+    );
+}
+
+/// Every byte was written, but the writer was dropped instead of shut down, so the last
+/// partial chunk never left it. `bytes_written` equals the declared length here - which is
+/// why delivery is measured by what reached the channel.
+#[tokio::test]
+async fn dropping_the_writer_with_a_partial_chunk_is_reported_as_short() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    // One full 512 KiB chunk goes out on its own; the 188 KB tail only on shutdown.
+    let length = 700_000;
+
+    let (mut writer, handle) =
+        client.start_upload("my-bucket", "archives/dropped.bin", length, UPLOAD_TIMEOUT);
+
+    writer.write_all(&pattern(length)).await.unwrap();
+    assert_eq!(writer.bytes_written(), length as u64);
+    drop(writer);
+
+    let err = handle.finish().await.unwrap_err();
+
+    let io_error = err
+        .get_upload_producer_error()
+        .expect("a writer dropped with a buffered chunk is the writer's failure");
+
+    assert_eq!(io_error.kind(), std::io::ErrorKind::UnexpectedEof);
+    assert!(
+        io_error.to_string().contains("only 524288 of the 700000"),
+        "the error has to say how much really went out, got: {}",
+        io_error
+    );
+
+    assert_eq!(
+        server.uploaded_object("my-bucket", "archives/dropped.bin"),
+        None
+    );
+}
+
+/// The byte past the declared length is refused and never sent. The refusal itself touches
+/// nothing: the 1 000 accepted bytes are still buffered, and ending the body properly
+/// delivers exactly them.
+#[tokio::test]
+async fn writing_past_a_started_uploads_length_is_refused_and_not_sent() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    let (mut writer, handle) =
+        client.start_upload("my-bucket", "archives/over.bin", 1_000, UPLOAD_TIMEOUT);
+
+    let err = writer.write_all(&pattern(1_500)).await.unwrap_err();
+
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(writer.bytes_written(), 1_000);
+
+    writer.shutdown().await.unwrap();
+    handle.finish().await.unwrap();
+
+    let captured = server.captured();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].body.len(), 1_000, "not one extra byte went out");
+
+    assert_eq!(
+        server.uploaded_object("my-bucket", "archives/over.bin"),
+        Some(pattern(1_000))
+    );
+}
+
+/// The same refusal, followed by what a caller that bails out on the error does: drop the
+/// writer. No object now - but because the buffered 1 000 bytes never left the writer
+/// (0 of 1 000 went out), not because of the refusal.
+#[tokio::test]
+async fn bailing_out_after_writing_past_the_length_stores_nothing() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    let (mut writer, handle) =
+        client.start_upload("my-bucket", "archives/over.bin", 1_000, UPLOAD_TIMEOUT);
+
+    let err = writer.write_all(&pattern(1_500)).await.unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+    drop(writer);
+
+    let err = handle.finish().await.unwrap_err();
+
+    let io_error = err.get_upload_producer_error().expect("the writer's failure");
+    assert_eq!(io_error.kind(), std::io::ErrorKind::UnexpectedEof);
+    assert!(
+        io_error.to_string().contains("only 0 of the 1000"),
+        "got: {}",
+        io_error
+    );
+
+    assert_eq!(
+        server.uploaded_object("my-bucket", "archives/over.bin"),
+        None
+    );
+}
+
+/// The storage refuses the upload half-way, with an answer. The writer only learns that the
+/// upload is gone - `BrokenPipe` - and `finish` says why: the storage's own error, not
+/// the pipe.
+#[tokio::test]
+async fn a_server_that_answers_500_mid_body_surfaces_through_finish() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    server.answer_next_request_after(
+        64 * 1024,
+        500,
+        "<Error><Code>InternalError</Code><Message>We encountered an internal error.</Message></Error>",
+    );
+
+    let (mut writer, handle) = client.start_upload(
+        "my-bucket",
+        "archives/refused.bin",
+        32 * 1024 * 1024,
+        UPLOAD_TIMEOUT,
+    );
+
+    let err = tokio::time::timeout(Duration::from_secs(30), write_until_refused(&mut writer))
+        .await
+        .expect("the writer has to be woken when the upload dies");
+
+    assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+
+    let err = handle.finish().await.unwrap_err();
+
+    assert_eq!(
+        err.get_status_code(),
+        Some(500),
+        "the storage's answer, not the broken pipe it caused - got: {}",
+        err
+    );
+    assert!(!err.is_upload_producer_failed());
+    assert!(err.is_retryable());
+
+    assert_eq!(
+        server.uploaded_object("my-bucket", "archives/refused.bin"),
+        None
+    );
+}
+
+/// The same with no answer at all - the connection is simply cut. Still the upload's
+/// failure, not the writer's.
+#[tokio::test]
+async fn a_connection_cut_mid_body_is_the_uploads_failure_not_the_writers() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    server.abort_next_request_after(64 * 1024);
+
+    let (mut writer, handle) = client.start_upload(
+        "my-bucket",
+        "archives/cut.bin",
+        32 * 1024 * 1024,
+        UPLOAD_TIMEOUT,
+    );
+
+    let err = tokio::time::timeout(Duration::from_secs(30), write_until_refused(&mut writer))
+        .await
+        .expect("the writer has to be woken when the upload dies");
+
+    assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+
+    let err = handle.finish().await.unwrap_err();
+
+    assert!(
+        !err.is_upload_producer_failed(),
+        "the upload died first, so its own error explains this - got: {}",
+        err
+    );
+
+    assert_eq!(
+        server.uploaded_object("my-bucket", "archives/cut.bin"),
+        None
+    );
+}
+
+/// A refusal that arrives after the whole body: the plain case, and a retryable one.
+#[tokio::test]
+async fn a_server_error_after_the_body_is_what_finish_returns() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    server.push_reply(
+        503,
+        "<Error><Code>ServiceUnavailable</Code><Message>later</Message></Error>",
+    );
+
+    let (mut writer, handle) =
+        client.start_upload("my-bucket", "archives/later.bin", 10_000, UPLOAD_TIMEOUT);
+
+    writer.write_all(&pattern(10_000)).await.unwrap();
+    writer.shutdown().await.unwrap();
+
+    let err = handle.finish().await.unwrap_err();
+
+    assert_eq!(err.get_status_code(), Some(503));
+    assert!(err.is_retryable());
+    assert!(!err.is_upload_producer_failed());
+
+    assert_eq!(
+        server.uploaded_object("my-bucket", "archives/later.bin"),
+        None
+    );
+}
+
+/// Drops the handle of an upload whose request is genuinely in flight - the body is
+/// already being drained into the socket - and checks that the upload is cancelled.
+///
+/// "In flight" is established rather than assumed: more chunks than the channel, the
+/// pending send and the buffer can hold between them have been accepted, which only
+/// happens once the request has taken some. Dropping the handle any earlier would abort a
+/// task that never ran, and prove nothing about cancelling a live request.
+async fn dropping_the_handle_of_an_upload_in_flight_cancels_it() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    let (mut writer, handle) = client.start_upload(
+        "my-bucket",
+        "archives/cancelled.bin",
+        32 * 1024 * 1024,
+        UPLOAD_TIMEOUT,
+    );
+
+    let piece = vec![5u8; 64 * 1024];
+    let in_flight = 8 * my_s3::DEFAULT_UPLOAD_CHUNK_SIZE as u64;
+
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while writer.bytes_written() < in_flight {
+            writer.write_all(&piece).await.unwrap();
+        }
+    })
+    .await
+    .expect("the request has to start draining the body");
+
+    assert_eq!(server.connections_accepted(), 1);
+
+    drop(handle);
+
+    let err = tokio::time::timeout(Duration::from_secs(30), write_until_refused(&mut writer))
+        .await
+        .expect("the writer has to be woken when the upload is cancelled");
+
+    assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+
+    assert_eq!(
+        server.uploaded_object("my-bucket", "archives/cancelled.bin"),
+        None
+    );
+}
+
+#[tokio::test]
+async fn dropping_the_handle_cancels_the_upload() {
+    dropping_the_handle_of_an_upload_in_flight_cancels_it().await;
+}
+
+/// The same with the upload task and the writer on different worker threads, where the
+/// abort lands while both are running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropping_the_handle_cancels_the_upload_on_a_multi_threaded_runtime() {
+    dropping_the_handle_of_an_upload_in_flight_cancels_it().await;
+}
+
+/// A handle dropped before the writer produced anything: the request was never started,
+/// and is not started by the chunks that follow.
+#[tokio::test]
+async fn dropping_the_handle_before_the_first_chunk_never_opens_a_connection() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    let (mut writer, handle) = client.start_upload(
+        "my-bucket",
+        "archives/never.bin",
+        32 * 1024 * 1024,
+        UPLOAD_TIMEOUT,
+    );
+
+    writer.write_all(&pattern(100)).await.unwrap();
+
+    drop(handle);
+
+    let err = tokio::time::timeout(Duration::from_secs(30), write_until_refused(&mut writer))
+        .await
+        .expect("the writer has to be woken when the upload is cancelled");
+
+    assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+    assert_eq!(server.connections_accepted(), 0);
+    assert_eq!(server.request_count(), 0);
+}
+
+/// Nothing touches the network until the writer has a chunk to hand over - and then the
+/// request starts at once, without waiting for `shutdown`.
+#[tokio::test]
+async fn nothing_touches_the_network_before_the_first_chunk() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    let content = pattern(2 * my_s3::DEFAULT_UPLOAD_CHUNK_SIZE + 1_000);
+    let first_chunk = my_s3::DEFAULT_UPLOAD_CHUNK_SIZE;
+
+    let (mut writer, handle) =
+        client.start_upload("my-bucket", "archives/lazy.bin", content.len(), UPLOAD_TIMEOUT);
+
+    writer.write_all(&content[..100]).await.unwrap();
+
+    // Long enough for a spawned task to have connected, had it been going to.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(server.connections_accepted(), 0);
+
+    writer.write_all(&content[100..first_chunk]).await.unwrap();
+
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while server.connections_accepted() == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the first chunk has to start the request");
+
+    writer.write_all(&content[first_chunk..]).await.unwrap();
+    writer.shutdown().await.unwrap();
+
+    handle.finish().await.unwrap();
+
+    assert_eq!(server.connections_accepted(), 1);
+    assert_eq!(
+        server.uploaded_object("my-bucket", "archives/lazy.bin"),
+        Some(content)
+    );
+}
+
+/// The writer goes to one task and the handle to another - which is the point of having
+/// them separate. `finish` is awaited while the body is still being written.
+#[tokio::test]
+async fn the_writer_and_the_handle_live_on_different_tasks() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    let content = pattern(2_000_000);
+    let expected = content.clone();
+
+    let (mut writer, handle) = client.start_upload(
+        "my-bucket",
+        "archives/two-tasks.bin",
+        content.len(),
+        UPLOAD_TIMEOUT,
+    );
+
+    let writing = tokio::spawn(async move {
+        for piece in content.chunks(100_000) {
+            writer.write_all(piece).await?;
+        }
+        writer.shutdown().await
+    });
+
+    let finishing = tokio::spawn(handle.finish());
+
+    writing.await.unwrap().unwrap();
+    finishing.await.unwrap().unwrap();
+
+    assert_eq!(
+        server.uploaded_object("my-bucket", "archives/two-tasks.bin"),
+        Some(expected)
+    );
+}
+
+/// Two uploads at once, written alternately from one task. Each has its own channel and
+/// its own connection, so neither waits on the other and neither's bytes end up in the
+/// other's object.
+#[tokio::test]
+async fn two_started_uploads_run_side_by_side() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    let first = pattern(1_200_000);
+    // A different period, so a chunk that went to the wrong object cannot compare equal.
+    let second: Vec<u8> = (0..1_100_000).map(|index| (index % 241) as u8).collect();
+
+    let (mut first_writer, first_handle) =
+        client.start_upload("my-bucket", "archives/first.bin", first.len(), UPLOAD_TIMEOUT);
+    let (mut second_writer, second_handle) = client.start_upload(
+        "my-bucket",
+        "archives/second.bin",
+        second.len(),
+        UPLOAD_TIMEOUT,
+    );
+
+    let mut first_pieces = first.chunks(50_000);
+    let mut second_pieces = second.chunks(50_000);
+
+    loop {
+        let first_piece = first_pieces.next();
+        let second_piece = second_pieces.next();
+
+        if first_piece.is_none() && second_piece.is_none() {
+            break;
+        }
+
+        if let Some(piece) = first_piece {
+            first_writer.write_all(piece).await.unwrap();
+        }
+        if let Some(piece) = second_piece {
+            second_writer.write_all(piece).await.unwrap();
+        }
+    }
+
+    first_writer.shutdown().await.unwrap();
+    second_writer.shutdown().await.unwrap();
+
+    let (first_result, second_result) = tokio::join!(first_handle.finish(), second_handle.finish());
+    first_result.unwrap();
+    second_result.unwrap();
+
+    assert_eq!(server.request_count(), 2);
+    assert_eq!(
+        server.uploaded_object("my-bucket", "archives/first.bin"),
+        Some(first)
+    );
+    assert_eq!(
+        server.uploaded_object("my-bucket", "archives/second.bin"),
+        Some(second)
+    );
+}
+
+/// The upload dies - here, its timeout runs out - while the writer is still alive and has
+/// not tried to write since. The writer has not abandoned anything, so the answer is the
+/// upload's own, retryable error; blaming the writer would turn the one case a caller
+/// should retry into one it must not.
+#[tokio::test]
+async fn an_upload_that_dies_under_a_live_writer_reports_its_own_error() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    let (mut writer, handle) = client.start_upload(
+        "my-bucket",
+        "archives/stalled.bin",
+        32 * 1024 * 1024,
+        Duration::from_secs(1),
+    );
+
+    writer
+        .write_all(&pattern(2 * my_s3::DEFAULT_UPLOAD_CHUNK_SIZE))
+        .await
+        .unwrap();
+
+    // The writer is still held, and owes 31 MiB.
+    let err = tokio::time::timeout(Duration::from_secs(30), handle.finish())
+        .await
+        .expect("the upload's own timeout has to end the wait")
+        .unwrap_err();
+
+    assert!(
+        !err.is_upload_producer_failed(),
+        "a live writer cannot be what broke the upload - got: {}",
+        err
+    );
+    assert!(err.is_retryable(), "a timeout is retryable - got: {}", err);
+
+    let err = tokio::time::timeout(Duration::from_secs(30), write_until_refused(&mut writer))
+        .await
+        .expect("the writer has to find out");
+    assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+
+    assert_eq!(
+        server.uploaded_object("my-bucket", "archives/stalled.bin"),
+        None
+    );
+}
+
+/// Both halves travel between tasks, and a handle may be held behind a shared reference
+/// while something else is awaited.
+#[test]
+fn the_upload_handle_is_send_sync_and_unpin() {
+    fn assert_send_sync_and_unpin<T: Send + Sync + Unpin>() {}
+
+    assert_send_sync_and_unpin::<my_s3::S3UploadHandle>();
 }
 
 // ---------------------------------------------------------------------------
@@ -2665,6 +3269,9 @@ fn client_futures_are_send() {
             3,
             |mut writer| async move { writer.shutdown().await },
         ));
+        // Only type-checked, never run: `start_upload` itself needs a runtime.
+        let (_writer, handle) = client.start_upload(bucket_name, key, 0, timeout);
+        assert_send(handle.finish());
         assert_send(client.download_file(bucket_name, key));
         assert_send(client.download_file_range(bucket_name, key, 0, None));
         assert_send(client.download_file_as_stream(bucket_name, key));

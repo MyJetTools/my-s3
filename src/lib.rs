@@ -14,3 +14,5 @@ mod reader;
 pub use reader::*;
 mod upload_writer;
 pub use upload_writer::*;
+mod upload_handle;
+pub use upload_handle::*;
