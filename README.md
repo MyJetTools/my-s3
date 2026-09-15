@@ -358,9 +358,11 @@ ending with `shutdown` — and a few more that come from the result living elsew
   over its first chunk or ends the body, so a writer taken early holds no socket, and
   `upload_timeout` covers the request itself, not the wait before it. Once started, each
   upload holds a connection of its own until its answer is read.
-- **`finish` waits for the body to end**, so call it after `shutdown` (or after the writer
-  has been dropped). Awaited while the writer still owes bytes, it waits with it — on the
-  same task, until `upload_timeout` gives up.
+- **Call `finish` after `shutdown`** (or after the writer has been dropped). It waits for
+  the upload, which normally ends with the body, so while the writer still owes bytes it
+  waits for the writer — returning sooner only if the upload fails first. Before the
+  writer has handed over its first chunk nothing bounds that wait: `upload_timeout` has not
+  started, and a `finish` awaited on the task that holds such a writer never returns.
 - **`finish` is the only proof.** `shutdown` returning `Ok` means the body was handed over,
   not that the storage has it.
 - **Dropping the handle cancels the upload**, and the writer's next write fails with

@@ -1321,6 +1321,16 @@ async fn dropping_the_handle_of_an_upload_in_flight_cancels_it() {
     .await
     .expect("the request has to start draining the body");
 
+    // Taking the chunks proves the client connected, not that the server's accept loop
+    // has run yet - the kernel buffers a connection still waiting in the backlog.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while server.connections_accepted() == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the server has to see the connection");
+
     assert_eq!(server.connections_accepted(), 1);
 
     drop(handle);
@@ -1347,6 +1357,77 @@ async fn dropping_the_handle_cancels_the_upload() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dropping_the_handle_cancels_the_upload_on_a_multi_threaded_runtime() {
     dropping_the_handle_of_an_upload_in_flight_cancels_it().await;
+}
+
+/// The writer feels a dropped handle at once. Aborting the task only schedules its
+/// teardown, and until then the channel would still take chunks - so without this a small
+/// body could be written and "ended" with `shutdown` returning `Ok`, into an upload that
+/// no longer exists.
+#[tokio::test]
+async fn the_very_next_write_after_the_handle_is_dropped_is_refused() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    let (mut writer, handle) =
+        client.start_upload("my-bucket", "archives/at-once.bin", 1_000, UPLOAD_TIMEOUT);
+
+    writer.write_all(&pattern(100)).await.unwrap();
+
+    drop(handle);
+
+    let err = writer.write_all(&pattern(100)).await.unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+
+    let err = writer.shutdown().await.unwrap_err();
+    assert_eq!(
+        err.kind(),
+        std::io::ErrorKind::BrokenPipe,
+        "a body cannot be ended into a cancelled upload"
+    );
+
+    drop(writer);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    assert_eq!(server.connections_accepted(), 0);
+    assert_eq!(
+        server.uploaded_object("my-bucket", "archives/at-once.bin"),
+        None
+    );
+}
+
+/// A handle that went through `finish` leaves its writer alone: a finished upload is not a
+/// cancelled one, so a writer that is still around is not told it is.
+#[tokio::test]
+async fn a_finished_handle_does_not_cancel_anything_when_it_goes() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    // Exactly one chunk: the body is complete as soon as it is sent, without `shutdown`.
+    let content = pattern(my_s3::DEFAULT_UPLOAD_CHUNK_SIZE);
+
+    let (mut writer, handle) = client.start_upload(
+        "my-bucket",
+        "archives/boundary.bin",
+        content.len(),
+        UPLOAD_TIMEOUT,
+    );
+
+    writer.write_all(&content).await.unwrap();
+
+    tokio::time::timeout(Duration::from_secs(30), handle.finish())
+        .await
+        .expect("a complete body ends the upload on its own")
+        .unwrap();
+
+    // Still the writer's own answers, not a cancellation's.
+    let err = writer.write_all(b"x").await.unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    writer.shutdown().await.unwrap();
+
+    assert_eq!(
+        server.uploaded_object("my-bucket", "archives/boundary.bin"),
+        Some(content)
+    );
 }
 
 /// A handle dropped before the writer produced anything: the request was never started,
@@ -1455,14 +1536,21 @@ async fn the_writer_and_the_handle_live_on_different_tasks() {
 /// Two uploads at once, written alternately from one task. Each has its own channel and
 /// its own connection, so neither waits on the other and neither's bytes end up in the
 /// other's object.
+///
+/// Each object is far larger than what a writer can hold with its upload idle - the
+/// queued chunks, the send waiting to join them, the buffer - so the alternating writes
+/// can only get through if both requests drain their bodies at the same time. Two uploads
+/// that ran one after the other would stall the loop, and the timeout would say so.
 #[tokio::test]
 async fn two_started_uploads_run_side_by_side() {
     let server = FakeS3::start().await;
     let client = server.client();
 
-    let first = pattern(1_200_000);
+    let first = pattern(8 * 1024 * 1024);
     // A different period, so a chunk that went to the wrong object cannot compare equal.
-    let second: Vec<u8> = (0..1_100_000).map(|index| (index % 241) as u8).collect();
+    let second: Vec<u8> = (0..8 * 1024 * 1024 + 1_000)
+        .map(|index| (index % 241) as u8)
+        .collect();
 
     let (mut first_writer, first_handle) =
         client.start_upload("my-bucket", "archives/first.bin", first.len(), UPLOAD_TIMEOUT);
@@ -1473,24 +1561,38 @@ async fn two_started_uploads_run_side_by_side() {
         UPLOAD_TIMEOUT,
     );
 
-    let mut first_pieces = first.chunks(50_000);
-    let mut second_pieces = second.chunks(50_000);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let mut first_pieces = first.chunks(256 * 1024);
+        let mut second_pieces = second.chunks(256 * 1024);
 
-    loop {
-        let first_piece = first_pieces.next();
-        let second_piece = second_pieces.next();
+        loop {
+            let first_piece = first_pieces.next();
+            let second_piece = second_pieces.next();
 
-        if first_piece.is_none() && second_piece.is_none() {
-            break;
-        }
+            if first_piece.is_none() && second_piece.is_none() {
+                break;
+            }
 
-        if let Some(piece) = first_piece {
-            first_writer.write_all(piece).await.unwrap();
+            if let Some(piece) = first_piece {
+                first_writer.write_all(piece).await.unwrap();
+            }
+            if let Some(piece) = second_piece {
+                second_writer.write_all(piece).await.unwrap();
+            }
         }
-        if let Some(piece) = second_piece {
-            second_writer.write_all(piece).await.unwrap();
+    })
+    .await
+    .expect("both uploads have to drain their bodies at the same time");
+
+    // Two connections, and not one reused in turn. Waited for, because the server's
+    // accept loop may lag behind a client that is already writing.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while server.connections_accepted() < 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
-    }
+    })
+    .await
+    .expect("each upload has to have a connection of its own");
 
     first_writer.shutdown().await.unwrap();
     second_writer.shutdown().await.unwrap();

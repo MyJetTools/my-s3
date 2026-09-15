@@ -61,6 +61,12 @@ pub(crate) struct UploadWriterState {
     /// Set the first time a send finds the channel closed. That only happens when the
     /// upload has already ended, which makes everything the producer reports afterwards
     /// a consequence rather than a cause.
+    ///
+    /// Also set by an [`S3UploadHandle`] dropped while its upload is still running, so the
+    /// writer refuses its very next write instead of filling the channel of a task that
+    /// is being torn down.
+    ///
+    /// [`S3UploadHandle`]: crate::S3UploadHandle
     upload_ended: AtomicBool,
     /// Set when the writer ends the body - by `shutdown`, or by being dropped - and
     /// always *before* its `Sender` goes, so the upload, which learns of the end through
@@ -113,6 +119,11 @@ impl UploadWriterState {
 
     pub(crate) fn upload_ended(&self) -> bool {
         self.upload_ended.load(Ordering::Acquire)
+    }
+
+    /// The upload is gone without a send having found out yet - its handle was dropped.
+    pub(crate) fn mark_upload_ended(&self) {
+        self.upload_ended.store(true, Ordering::Release);
     }
 
     pub(crate) fn body_ended(&self) -> bool {
@@ -416,11 +427,19 @@ impl S3UploadWriter {
         let mut pending: PendingSend = Box::pin(async move {
             let length = chunk.len() as u64;
 
-            if sender.send(chunk).await.is_err() {
+            // Room first, then the count, then the chunk - with no await between the
+            // last two. `send` would make the chunk receivable *before* it returned, and
+            // an upload on another thread could take it, finish the body and be settled
+            // by `S3UploadHandle::finish` while `sent` was still one chunk short: a stored
+            // object reported as a short body. Counting before the chunk is visible means
+            // the upload can never have consumed bytes `sent` does not include.
+            let Ok(permit) = sender.reserve().await else {
                 return false;
-            }
+            };
 
             state.sent.fetch_add(length, Ordering::AcqRel);
+            permit.send(chunk);
+
             true
         });
 
@@ -525,6 +544,13 @@ impl AsyncWrite for S3UploadWriter {
 
         if this.poll_pending(cx)?.is_pending() {
             return Poll::Pending;
+        }
+
+        // The same refusal `poll_write` gives, and for the same reason. It matters most
+        // for `shutdown`, which flushes first: a body "ended" into an upload that is
+        // already gone must not report `Ok`, even when the channel still had room.
+        if this.state.upload_ended() {
+            return Poll::Ready(Err(this.upload_is_gone()));
         }
 
         if this.buffer.is_empty() {

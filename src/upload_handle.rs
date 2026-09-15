@@ -19,8 +19,8 @@ use super::upload_writer::UploadWriterState;
 /// # Dropping it cancels the upload
 ///
 /// A handle dropped without `finish` aborts the upload task, so an object whose result
-/// nobody waits for does not quietly land in the bucket. The writer finds out on its next
-/// write that needs the channel, as [`std::io::ErrorKind::BrokenPipe`].
+/// nobody waits for does not quietly land in the bucket. The writer finds out at once: its
+/// next write, flush or `shutdown` fails with [`std::io::ErrorKind::BrokenPipe`].
 ///
 /// That is a promise about an upload that has **not been answered yet**. A handle dropped
 /// after the whole body went out races the storage: the object may already have been
@@ -75,10 +75,18 @@ impl S3UploadHandle {
     /// Waits for the upload to end, and says whether the object was stored.
     ///
     /// Call it **after** the writer's `shutdown()`, or after the writer has been dropped.
-    /// It waits for the body to end: while the writer is alive and still owes bytes, this
-    /// waits with it - until the writer ends the body, or until `upload_timeout` fails the
-    /// upload. The writer and the handle may well live on different tasks; awaiting this
-    /// on the task that holds an unfinished writer only ever ends in that timeout.
+    ///
+    /// It waits for the upload, and an upload normally ends with its body - so while the
+    /// writer is alive and still owes bytes, this waits for the writer. It returns sooner
+    /// only when the upload fails first: the storage refuses it, the connection dies,
+    /// `upload_timeout` runs out. The writer and the handle may well live on different
+    /// tasks.
+    ///
+    /// **Nothing bounds the wait before the first chunk.** `upload_timeout` covers the
+    /// request, and the request starts only when the writer hands over a chunk (a full
+    /// one, or a flush) or ends the body. Awaited on the task that holds a writer which
+    /// has not got that far, this never returns. Past the first chunk it ends at the
+    /// latest in the `upload_timeout` error.
     ///
     /// # What comes back
     ///
@@ -151,11 +159,22 @@ impl S3UploadHandle {
     }
 }
 
-/// `abort` on a task that has already finished does nothing, so a handle that went
-/// through [`S3UploadHandle::finish`] is unaffected. It needs no runtime context either,
-/// so a handle dropped during shutdown is fine.
+/// A handle that went through [`S3UploadHandle::finish`] holds a finished task, and is
+/// left alone: its writer, if it is still around, keeps behaving as the finished upload
+/// left it.
+///
+/// Otherwise the upload is cancelled. `abort` only *schedules* that - the task lets go of
+/// the channel when the runtime next gets to it, and until then the writer's sends would
+/// still find room - so the end of the upload is recorded first, where the writer checks
+/// before every write. Neither needs a runtime context, so a handle dropped during
+/// shutdown is fine.
 impl Drop for S3UploadHandle {
     fn drop(&mut self) {
+        if self.upload.is_finished() {
+            return;
+        }
+
+        self.state.mark_upload_ended();
         self.upload.abort();
     }
 }
@@ -209,6 +228,35 @@ mod tests {
         assert!(!err.is_retryable());
 
         drop(writer);
+    }
+
+    /// The case the early return exists for: the task panicked *and* the body has ended
+    /// short, with no send ever finding the channel closed. Without deciding the panic
+    /// first, those are exactly the inputs that settle as the writer's failure.
+    #[tokio::test]
+    async fn an_upload_task_that_panics_is_not_blamed_on_a_body_that_ended_short() {
+        let (mut writer, _body, state) = S3UploadWriter::new("my-bucket", "a.bin", 1_000, 512);
+
+        // One 512-byte chunk sent, 88 bytes left in the buffer and lost with the writer.
+        writer.write_all(&[7u8; 600]).await.unwrap();
+        drop(writer);
+
+        let upload = tokio::spawn(async { panic!("the upload task broke") });
+        let handle = S3UploadHandle::new(upload, state, "my-bucket", "a.bin");
+
+        let err = handle.finish().await.unwrap_err();
+
+        assert!(
+            !err.is_upload_producer_failed(),
+            "a panic in the upload task is not the writer's failure, got: {}",
+            err
+        );
+        assert!(
+            err.to_string()
+                .contains("upload task for my-bucket/a.bin did not finish"),
+            "got: {}",
+            err
+        );
     }
 
     /// The same short body, once the writer has ended it: now the short body *is* the

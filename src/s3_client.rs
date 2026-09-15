@@ -526,10 +526,11 @@ impl S3Client {
     /// - **End the body with `shutdown`.** It sends the last partial chunk. Dropping the
     ///   writer also ends the body, without sending it - and `finish` then reports
     ///   "only N of M bytes went out".
-    /// - **Call `finish` after the body has ended.** It waits for the body; see
-    ///   [`S3UploadHandle::finish`].
-    /// - **Dropping the handle cancels the upload**, and the writer's next write fails with
-    ///   [`std::io::ErrorKind::BrokenPipe`]. An object nobody waits for does not quietly
+    /// - **Call `finish` after the body has ended.** It waits for the upload, which
+    ///   normally means for the body - and before the first chunk nothing bounds that
+    ///   wait; see [`S3UploadHandle::finish`].
+    /// - **Dropping the handle cancels the upload**, and the writer's next write, flush or
+    ///   `shutdown` fails with [`std::io::ErrorKind::BrokenPipe`]. An object nobody waits for does not quietly
     ///   land - with the one caveat [`S3UploadHandle`] spells out for a body that already
     ///   went out whole.
     /// - **Nothing is retried.** A streamed body cannot be sent twice. When `finish` says
