@@ -92,6 +92,26 @@ async fn host_is_signed_as_sent_for_a_plain_http_endpoint() {
     assert!(!host.contains("http"), "got {:?}", host);
 }
 
+/// An endpoint that is not a usable url is bad input: the call fails at once, without a
+/// retry, and the error says what is wrong with the url so it can be fixed.
+#[tokio::test]
+async fn an_unusable_endpoint_is_an_error_saying_why() {
+    let client = my_s3::S3Client::new("access-key", "secret-key", "eu-west-1", "http://");
+
+    let err = client
+        .download_file("my-bucket", "hello.txt")
+        .await
+        .unwrap_err();
+
+    assert!(
+        err.to_string()
+            .contains("Invalid url 'http://': it names no host"),
+        "got {}",
+        err
+    );
+    assert!(!err.is_retryable(), "bad input must not be retried");
+}
+
 /// Keys with slashes must go out as a path so objects appear as folders in the bucket -
 /// percent-encoding the separator would create one object literally named `a%2Fb`.
 #[tokio::test]

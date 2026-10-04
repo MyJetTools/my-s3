@@ -23,8 +23,8 @@ pub type HmacSha256 = Hmac<Sha256>;
 /// `x-amz-content-sha256` and `x-amz-date` are in `SignedHeaders`, so unsigned extras
 /// such as `Range` are fine either way).
 ///
-/// Panics when `fl_url` has already met an error - an endpoint that is not a usable
-/// url, a header that can not be put on the wire - with that error in the message.
+/// Fails with [`S3Error::Other`] carrying the error when `fl_url` has already met one -
+/// an endpoint that is not a usable url, a header that can not be put on the wire.
 pub fn sign_request(
     s3: &S3Client,
     fl_url: FlUrl,
@@ -43,10 +43,16 @@ pub fn sign_request_with_payload_hash(
 ) -> Result<FlUrl, S3Error> {
     let service = "s3";
 
-    // An error here is bad input - an endpoint that is not a usable url, say - and
-    // there is nothing to do with such a request but fix the input. So it stops the
-    // flow, and the panic says what was wrong.
-    let url_builder = fl_url.get_url_builder().unwrap();
+    // An error here is bad input - an endpoint that is not a usable url, say. There is
+    // nothing to sign and nothing to send, so it goes straight back, saying what has to
+    // be fixed. `FlUrlError` is not `Clone`, and only a reference to it is handed out,
+    // hence its text rather than the error itself.
+    let url_builder = match fl_url.get_url_builder() {
+        Ok(url_builder) => url_builder,
+        Err(err) => {
+            return Err(S3Error::Other(format!("Can not sign the request: {}", err)));
+        }
+    };
 
     // Exactly what FlUrl will put in the Host header and on the request line.
     let host = url_builder.get_host_port().to_string();
