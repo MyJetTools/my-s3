@@ -22,6 +22,9 @@ pub type HmacSha256 = Hmac<Sha256>;
 /// any further `with_header` that must not be signed (only `host`,
 /// `x-amz-content-sha256` and `x-amz-date` are in `SignedHeaders`, so unsigned extras
 /// such as `Range` are fine either way).
+///
+/// Panics when `fl_url` has already met an error - an endpoint that is not a usable
+/// url, a header that can not be put on the wire - with that error in the message.
 pub fn sign_request(
     s3: &S3Client,
     fl_url: FlUrl,
@@ -40,12 +43,10 @@ pub fn sign_request_with_payload_hash(
 ) -> Result<FlUrl, S3Error> {
     let service = "s3";
 
-    // No url builder means the builder has already met an error (an unusable
-    // endpoint, say). There is nothing to sign; handing the request back as is lets
-    // it fail with that error when it is sent, instead of a vaguer one made up here.
-    let Some(url_builder) = fl_url.get_url_builder() else {
-        return Ok(fl_url);
-    };
+    // An error here is bad input - an endpoint that is not a usable url, say - and
+    // there is nothing to do with such a request but fix the input. So it stops the
+    // flow, and the panic says what was wrong.
+    let url_builder = fl_url.get_url_builder().unwrap();
 
     // Exactly what FlUrl will put in the Host header and on the request line.
     let host = url_builder.get_host_port().to_string();
