@@ -177,7 +177,18 @@ fn fl_url_error_is_retryable(err: &FlUrlError) -> bool {
     match err {
         FlUrlError::IoError(_) | FlUrlError::ReadingHyperBodyError(_) => true,
 
-        FlUrlError::MyHttpClientError(err) => err.is_retryable(),
+        // fl-url reports a connection that could not be established, or whose handshake
+        // failed, through my-http-client (the `FlUrlError` variants that used to carry
+        // them are gone). Both say nothing about the request, so they stay retryable, as
+        // they were; for the rest, my-http-client knows which of its failures a fresh
+        // connection can cure.
+        FlUrlError::MyHttpClientError(err) => {
+            matches!(
+                err,
+                flurl::my_http_client::MyHttpClientError::CanNotConnectToRemoteHost(_)
+                    | flurl::my_http_client::MyHttpClientError::InvalidHttpHandshake(_)
+            ) || err.is_retryable()
+        }
 
         // Configuration and programming errors: a retry changes nothing. `FlUrlError`
         // is #[non_exhaustive], so unknown future variants land here too - defaulting
