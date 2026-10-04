@@ -666,10 +666,15 @@ impl S3Client {
         key: &str,
         range: Option<(u64, Option<u64>)>,
     ) -> Result<Vec<u8>, S3Error> {
+        // The body IS the object (or the range of it) the caller asked for, so its size is
+        // the caller's decision. fl-url caps a buffered body at 10 MB by default
+        // (`DEFAULT_MAX_RESPONSE_BODY_SIZE`), which would fail every larger download with
+        // `ResponseBodyTooLarge`; the cap is lifted here, as it was before fl-url had one.
         let fl_url = flurl::FlUrl::new(self.endpoint.as_str())
             .append_path_segment(bucket_name)
             .append_path_segment(key)
-            .with_retries(3);
+            .with_retries(3)
+            .set_max_response_body_size(usize::MAX);
 
         let fl_url = super::utils::sign_request(self, fl_url, "GET", [].as_slice())?;
 
