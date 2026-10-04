@@ -1687,6 +1687,42 @@ fn the_upload_handle_is_send_sync_and_unpin() {
 }
 
 // ---------------------------------------------------------------------------
+// Download: fl-url's buffered-body cap
+// ---------------------------------------------------------------------------
+
+/// fl-url caps a buffered response body at `DEFAULT_MAX_RESPONSE_BODY_SIZE` (10 MB) and
+/// fails a bigger one with `ResponseBodyTooLarge`. A download is the object, or the range
+/// of it, that the caller asked for, so it must come back whole however big it is - both
+/// through `download_file` and through `download_file_range`.
+#[tokio::test]
+async fn an_object_bigger_than_fl_urls_body_cap_downloads_whole() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    let size = flurl::DEFAULT_MAX_RESPONSE_BODY_SIZE + 2 * 1024 * 1024;
+    let content: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+    server.put_object("my-bucket", "big.bin", content.clone());
+
+    let whole = client.download_file("my-bucket", "big.bin").await.unwrap();
+    assert_eq!(whole.len(), size);
+    assert!(
+        whole == content,
+        "the downloaded bytes differ from the object"
+    );
+
+    let end = flurl::DEFAULT_MAX_RESPONSE_BODY_SIZE + 1024 * 1024;
+    let range = client
+        .download_file_range("my-bucket", "big.bin", 0, Some(end as u64))
+        .await
+        .unwrap();
+    assert_eq!(range.len(), end + 1);
+    assert!(
+        range[..] == content[..=end],
+        "the downloaded range differs from the object"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Delete: the 204 bug
 // ---------------------------------------------------------------------------
 
