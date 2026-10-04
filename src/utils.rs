@@ -40,10 +40,17 @@ pub fn sign_request_with_payload_hash(
 ) -> Result<FlUrl, S3Error> {
     let service = "s3";
 
+    // No url builder means the builder has already met an error (an unusable
+    // endpoint, say). There is nothing to sign; handing the request back as is lets
+    // it fail with that error when it is sent, instead of a vaguer one made up here.
+    let Some(url_builder) = fl_url.get_url_builder() else {
+        return Ok(fl_url);
+    };
+
     // Exactly what FlUrl will put in the Host header and on the request line.
-    let host = fl_url.url_builder.get_host_port().to_string();
-    let canonical_uri = fl_url.url_builder.get_path().to_string();
-    let canonical_query = canonical_query_string(fl_url.url_builder.get_query());
+    let host = url_builder.get_host_port().to_string();
+    let canonical_uri = url_builder.get_path().to_string();
+    let canonical_query = canonical_query_string(url_builder.get_query());
 
     let timestamp = get_amz_timestamp();
     let date = timestamp[..8].to_string();

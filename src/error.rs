@@ -170,16 +170,12 @@ impl S3Error {
 /// for a large upload usually means `upload_timeout` was too small rather than that the
 /// network is broken; retrying without raising it will just time out again.
 fn fl_url_error_is_retryable(err: &FlUrlError) -> bool {
-    if err.is_timeout() || err.is_hyper_canceled() {
+    if err.is_timeout() {
         return true;
     }
 
     match err {
-        FlUrlError::IoError(_)
-        | FlUrlError::CanNotEstablishConnection(_)
-        | FlUrlError::InvalidHttp1HandShake(_)
-        | FlUrlError::ReadingHyperBodyError(_)
-        | FlUrlError::HyperError(_) => true,
+        FlUrlError::IoError(_) | FlUrlError::ReadingHyperBodyError(_) => true,
 
         FlUrlError::MyHttpClientError(err) => err.is_retryable(),
 
