@@ -2245,6 +2245,22 @@ async fn download_returns_the_body() {
     assert_eq!(server.captured()[0].method, "GET");
 }
 
+/// `download_file` is asked for the whole object, so it reads one of any size: this
+/// crate puts no limit on it. 11 MB is past the 10 MB a buffered read of FlUrl used to
+/// be refused at by default.
+#[tokio::test]
+async fn download_reads_an_object_of_any_size() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    let content = pattern(11 * 1024 * 1024);
+    server.put_object("my-bucket", "big.bin", content.clone());
+
+    let body = client.download_file("my-bucket", "big.bin").await.unwrap();
+
+    assert!(body == content, "got {} bytes", body.len());
+}
+
 /// `Range` is not in SignedHeaders, so it is added after signing - this checks that
 /// doing so does not invalidate the signature.
 #[tokio::test]

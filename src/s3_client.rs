@@ -25,6 +25,18 @@ const DEBUG_PREFIX: &str = "[my-s3]";
 /// leaves the value type unresolved. This names it once instead of at every call site.
 const NO_VALUE: Option<&str> = None;
 
+/// The most of an answer of the storage itself - an `<Error>`, a listing, a bucket's
+/// location - that is read into memory. These are XML of a few kilobytes, and a listing
+/// of 1000 keys stays well under a megabyte: anything bigger is not S3 talking, and
+/// fails with `FlUrlError::ResponseBodyTooLarge` instead of being held.
+const MAX_ANSWER_SIZE: usize = 10 * 1024 * 1024;
+
+/// An object read into memory has no limit of this crate's: [`S3Client::download_file`]
+/// is asked for the whole object, and a cap here would only make the size of objects it
+/// can fetch an arbitrary constant. An object too big to hold is read with
+/// [`S3Client::download_file_as_stream`] or [`S3Client::open_reader`].
+const MAX_OBJECT_SIZE: usize = usize::MAX;
+
 /// `Clone` because [`Self::open_reader`] hands one to every [`S3Reader`]: the ranged
 /// `GET`s a reader issues are `'static` futures, so they cannot borrow the client they
 /// came from - and so does [`Self::start_upload`], for the task its request runs on. The
@@ -683,7 +695,7 @@ impl S3Client {
             None => fl_url,
         };
 
-        let fl_url_response = self.send_get(fl_url).await?;
+        let mut fl_url_response = self.send_get(fl_url).await?;
 
         let status_code = fl_url_response.get_status_code();
 
@@ -693,7 +705,10 @@ impl S3Client {
         // handing back far more data than asked for.
         let expected = if range.is_some() { 206 } else { 200 };
         if status_code == expected {
-            let body = fl_url_response.receive_body().await?;
+            let body = fl_url_response
+                .get_body()?
+                .into_vec(MAX_OBJECT_SIZE)
+                .await?;
             self.trace_response(status_code, Some(&body));
             return Ok(body);
         }
@@ -713,7 +728,10 @@ impl S3Client {
             ));
         }
 
-        let body = fl_url_response.receive_body().await?;
+        let body = fl_url_response
+            .get_body()?
+            .into_vec(MAX_ANSWER_SIZE)
+            .await?;
         self.trace_response(status_code, Some(&body));
         Err(detect_error(status_code, &body))
     }
@@ -981,25 +999,24 @@ impl S3Client {
 
         let fl_url = super::utils::sign_request(self, fl_url, "GET", [].as_slice())?;
 
-        let response = self.send_get(fl_url).await?;
+        let mut response = self.send_get(fl_url).await?;
 
         let status_code = response.get_status_code();
 
         if !is_success(status_code) {
             // Small, and the only thing that says *why*. Reading it also settles the
             // connection, which a discarded streaming body would not.
-            let body = response.receive_body().await?;
+            let body = response.get_body()?.into_vec(MAX_ANSWER_SIZE).await?;
             self.trace_response(status_code, Some(&body));
             return Err(detect_error(status_code, &body));
         }
 
         // Deliberately not read: it is the object, and leaving it on the socket is the
-        // whole point. `read_success_body` is therefore not the right tool here, and
-        // calling it would also materialize the body and make `get_body_as_stream`
-        // panic.
+        // whole point. `read_success_body` is therefore not the right tool here: it
+        // would materialize the body, and leave none to stream.
         self.trace_response(status_code, None);
 
-        Ok(S3DownloadStream::from_response(response))
+        S3DownloadStream::from_response(response)
     }
 
     /// An object's size, without downloading it - `HEAD /{bucket}/{key}`, read out of
@@ -1109,12 +1126,14 @@ impl S3Client {
         Ok(())
     }
 
-    async fn read_success_body(&self, response: FlUrlResponse) -> Result<Vec<u8>, S3Error> {
+    async fn read_success_body(&self, mut response: FlUrlResponse) -> Result<Vec<u8>, S3Error> {
         let status_code = response.get_status_code();
 
         // Read the body either way: on success it is the payload, on failure it carries
         // `<Error><Code>`, which is the only reliable way to tell the failures apart.
-        let body = response.receive_body().await?;
+        // Either is an answer of the storage, never an object - those are read in
+        // `download_internal` and `download_file_as_stream`.
+        let body = response.get_body()?.into_vec(MAX_ANSWER_SIZE).await?;
 
         self.trace_response(status_code, Some(&body));
 
@@ -1212,9 +1231,9 @@ impl S3Client {
 
     /// Prints the answer, when [`Self::debug_to_console`] is on.
     ///
-    /// `FlUrl` traces requests but not answers, and it cannot: `receive_body` consumes
-    /// the body and `get_body_as_stream` hands it over, so tracing it there would mean
-    /// buffering an entire downloaded object. Here the body has been read already and
+    /// `FlUrl` traces requests but not answers, and it cannot: the body is read by
+    /// whoever takes it with `get_body`, whole or piece by piece, so tracing it there
+    /// would mean buffering an entire downloaded object. Here the body has been read already and
     /// the outcome is known, which is what makes the size/content asymmetry possible.
     ///
     /// `body` is `None` when the outcome was decided without reading it - a `416`, or a

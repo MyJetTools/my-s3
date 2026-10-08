@@ -36,9 +36,9 @@ pub struct S3DownloadStream {
     pub content_type: Option<String>,
 
     /// The body, still on the socket. Kept private: `flurl` is this crate's
-    /// implementation detail, and a `FlResponseAsStream` in the signature would make
+    /// implementation detail, and a `FlUrlBodyReader` in the signature would make
     /// every consumer depend on the same `flurl` version this crate happens to pin.
-    stream: flurl::FlResponseAsStream,
+    body: flurl::FlUrlBodyReader,
 
     /// Bytes handed to the caller so far, so the end of the stream can be checked
     /// against `content_length` rather than trusted.
@@ -46,11 +46,7 @@ pub struct S3DownloadStream {
 }
 
 impl S3DownloadStream {
-    pub(crate) fn from_response(response: flurl::FlUrlResponse) -> Self {
-        // Both headers have to be read *before* the body is taken, because
-        // `get_body_as_stream` consumes the response. Owning the values here (a `u64`
-        // and a `String`) is what ends the borrow in time.
-        //
+    pub(crate) fn from_response(mut response: flurl::FlUrlResponse) -> Result<Self, S3Error> {
         // Case-insensitively: HTTP header names are, and an S3-compatible storage is
         // free to answer `Content-Length` or `content-length`.
         let content_length = response
@@ -65,12 +61,12 @@ impl S3DownloadStream {
             .flatten()
             .map(|value| value.to_string());
 
-        Self {
+        Ok(Self {
             content_length,
             content_type,
-            stream: response.get_body_as_stream(),
+            body: response.get_body()?,
             received: 0,
-        }
+        })
     }
 
     /// The next chunk, or `Ok(None)` once the object has been delivered in full.
@@ -86,15 +82,15 @@ impl S3DownloadStream {
     /// The transport catches this first: a body that stops before `Content-Length` is
     /// reached comes back as a read error, not as the end of the stream. The byte count
     /// kept here is a backstop behind that, so the guarantee belongs to this type rather
-    /// than being inherited from whatever hyper does today - if the end of a stream is
-    /// ever reported after fewer bytes than the storage promised, it is refused here
-    /// instead of being passed off as a complete object.
+    /// than being inherited from whatever the transport does today - if the end of a
+    /// stream is ever reported after fewer bytes than the storage promised, it is refused
+    /// here instead of being passed off as a complete object.
     ///
     /// An object whose size was never stated (`content_length` is `None` - a chunked
     /// answer) has nothing to check against, so a truncation there rests on the
     /// transport alone.
     pub async fn get_next_chunk(&mut self) -> Result<Option<Vec<u8>>, S3Error> {
-        let Some(chunk) = self.stream.get_next_chunk().await? else {
+        let Some(chunk) = self.body.next_item().await? else {
             if let Some(expected) = self.content_length
                 && self.received < expected
             {
@@ -109,7 +105,9 @@ impl S3DownloadStream {
 
         self.received += chunk.len() as u64;
 
-        Ok(Some(chunk))
+        // The piece is a part of the buffer the connection is read into, and is read
+        // into again on the next call: what is handed out has to be a copy.
+        Ok(Some(chunk.to_vec()))
     }
 
     /// How many bytes have been handed out so far.
