@@ -151,9 +151,23 @@ impl S3Reader {
 
         PendingRead {
             future: Box::pin(async move {
-                client
+                let mut stream = client
                     .download_file_range(bucket_name.as_str(), key.as_str(), start, Some(end))
-                    .await
+                    .await?;
+
+                let mut body = Vec::with_capacity(requested);
+
+                while let Some(chunk) = stream.get_next_chunk().await? {
+                    body.extend_from_slice(&chunk);
+
+                    // Already more than was asked for: `poll_read` refuses it whatever
+                    // follows, so the rest of a misbehaving answer is not worth holding.
+                    if body.len() > requested {
+                        break;
+                    }
+                }
+
+                Ok(body)
             }),
             requested,
         }

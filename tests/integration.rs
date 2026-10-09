@@ -2261,6 +2261,16 @@ async fn download_reads_an_object_of_any_size() {
     assert!(body == content, "got {} bytes", body.len());
 }
 
+/// A range comes back as a stream; this is what a caller that wants it as one `Vec<u8>`
+/// writes.
+async fn read_to_end(mut stream: my_s3::S3DownloadStream) -> Vec<u8> {
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.get_next_chunk().await.unwrap() {
+        body.extend_from_slice(&chunk);
+    }
+    body
+}
+
 /// `Range` is not in SignedHeaders, so it is added after signing - this checks that
 /// doing so does not invalidate the signature.
 #[tokio::test]
@@ -2270,16 +2280,46 @@ async fn a_range_request_is_still_correctly_signed() {
 
     server.push_reply(206, "artial");
 
-    let body = client
+    let stream = client
         .download_file_range("my-bucket", "a.bin", 1, Some(6))
         .await
         .unwrap();
 
-    assert_eq!(body, b"artial");
+    assert_eq!(read_to_end(stream).await, b"artial");
 
     let captured = server.captured();
     assert_eq!(captured[0].header("range"), Some("bytes=1-6"));
     assert!(captured[0].signature_valid);
+}
+
+/// A range is handed over as a stream - returned once the head has arrived, with the
+/// range's own length - so a large one is never held unless the caller chooses to.
+#[tokio::test]
+async fn a_range_is_handed_over_as_a_stream() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    let content = pattern(3 * 1024 * 1024);
+    server.put_object("my-bucket", "big.bin", content.clone());
+
+    let mut stream = client
+        .download_file_range("my-bucket", "big.bin", 1024, Some(2 * 1024 * 1024 - 1))
+        .await
+        .unwrap();
+
+    assert_eq!(stream.content_length, Some(2 * 1024 * 1024 - 1024));
+
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.get_next_chunk().await.unwrap() {
+        body.extend_from_slice(&chunk);
+    }
+
+    assert!(
+        body.as_slice() == &content[1024..2 * 1024 * 1024],
+        "got {} bytes",
+        body.len()
+    );
+    assert_eq!(stream.received(), body.len() as u64);
 }
 
 #[tokio::test]

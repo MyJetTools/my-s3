@@ -137,13 +137,21 @@ therefore rests on TLS, so use an `https` endpoint. AWS and Ceph both accept thi
 
 ```rust
 let bytes = s3.download_file("my-bucket", "config.json").await?;
-let head = s3.download_file_range("my-bucket", "video.mp4", 0, Some(1023)).await?;
+
+// A range is a stream, like `download_file_as_stream` below - collect it if you need a Vec.
+let mut stream = s3.download_file_range("my-bucket", "video.mp4", 0, Some(1023)).await?;
+let mut head = Vec::new();
+while let Some(chunk) = stream.get_next_chunk().await? {
+    head.extend_from_slice(&chunk);
+}
 ```
 
 `download_file_range` takes **inclusive** byte offsets, following the HTTP `Range`
-semantics: `(0, Some(99))` is the first 100 bytes, and `end = None` reads to the end. A
-server that ignores `Range` and answers `200` with the whole object is reported as an
-error rather than silently handing back far more data than was asked for.
+semantics: `(0, Some(99))` is the first 100 bytes, and `end = None` reads to the end. It
+returns an `S3DownloadStream` whose `content_length` is the length of the range, so a
+large range is never held in memory unless the caller chooses to. A server that ignores
+`Range` and answers `200` with the whole object is reported as an error rather than
+silently handing back far more data than was asked for.
 
 For an object that should not be held in memory:
 
