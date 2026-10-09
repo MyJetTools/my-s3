@@ -135,28 +135,11 @@ therefore rests on TLS, so use an `https` endpoint. AWS and Ceph both accept thi
 
 ## Downloading
 
-```rust
-let bytes = s3.download_file("my-bucket", "config.json").await?;
-
-// A range is a stream, like `download_file_as_stream` below - collect it if you need a Vec.
-let mut stream = s3.download_file_range("my-bucket", "video.mp4", 0, Some(1023)).await?;
-let mut head = Vec::new();
-while let Some(chunk) = stream.get_next_chunk().await? {
-    head.extend_from_slice(&chunk);
-}
-```
-
-`download_file_range` takes **inclusive** byte offsets, following the HTTP `Range`
-semantics: `(0, Some(99))` is the first 100 bytes, and `end = None` reads to the end. It
-returns an `S3DownloadStream` whose `content_length` is the length of the range, so a
-large range is never held in memory unless the caller chooses to. A server that ignores
-`Range` and answers `200` with the whole object is reported as an error rather than
-silently handing back far more data than was asked for.
-
-For an object that should not be held in memory:
+Every read is a stream: `download_file` and `download_file_range` both return an
+`S3DownloadStream`, and the object is held in memory only if the caller collects it.
 
 ```rust
-let mut stream = s3.download_file_as_stream("my-bucket", "video.mp4").await?;
+let mut stream = s3.download_file("my-bucket", "video.mp4").await?;
 
 // Everything an HTTP response needs in order to forward this.
 let length = stream.content_length;                 // Option<u64>
@@ -171,6 +154,26 @@ This returns as soon as the response *head* has arrived, so peak memory is one c
 whatever the object's size — a server can forward an object it could never hold. A
 failure is still typed: a non-2xx body is small (it is the `<Error><Code>`) and is read,
 and only a successful answer is left streaming.
+
+Wanting the object as one `Vec<u8>` is a loop the caller writes:
+
+```rust
+let mut stream = s3.download_file("my-bucket", "config.json").await?;
+let mut bytes = Vec::new();
+while let Some(chunk) = stream.get_next_chunk().await? {
+    bytes.extend_from_slice(&chunk);
+}
+```
+
+`download_file_range` takes **inclusive** byte offsets, following the HTTP `Range`
+semantics: `(0, Some(99))` is the first 100 bytes, and `end = None` reads to the end.
+Its stream's `content_length` is the length of the range. A server that ignores `Range`
+and answers `200` with the whole object is reported as an error rather than silently
+handing back far more data than was asked for.
+
+```rust
+let mut stream = s3.download_file_range("my-bucket", "video.mp4", 0, Some(1023)).await?;
+```
 
 **A body that ends early is an `Err`, never `Ok(None)`.** A connection that breaks
 mid-object must not look like the end of one, or a truncated file gets written out and
@@ -215,7 +218,7 @@ own. After that:
 
 That last point cuts both ways: this is the shape for reading *pages* out of a large
 object, not for reading one front to back in small pieces — that would be one request
-per piece. Use `download_file_as_stream` for that.
+per piece. Use `download_file` for that.
 
 A reader is a single position with one request in flight, like a file handle. To read
 two places at once, open two readers — another `HEAD` each, and then fully independent.
@@ -459,7 +462,7 @@ is `NoSuchKey` as often as `NoSuchBucket`, `409` is `BucketAlreadyExists` as oft
 
 ```rust
 match s3.download_file("my-bucket", "maybe.json").await {
-    Ok(bytes) => { /* ... */ }
+    Ok(stream) => { /* ... */ }
     Err(err) if err.is_key_not_found() => { /* no data is not a failure */ }
     Err(err) if err.is_retryable() => { /* try again */ }
     Err(err) => return Err(err),

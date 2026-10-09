@@ -21,6 +21,16 @@ fn no_such_key_xml() -> &'static str {
 
 /// Pushes `content` through a channel the way a caller is expected to, and hands back
 /// the receiver.
+/// Every read comes back as a stream; this is what a caller that wants it as one `Vec<u8>`
+/// writes.
+async fn read_to_end(mut stream: my_s3::S3DownloadStream) -> Vec<u8> {
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.get_next_chunk().await.unwrap() {
+        body.extend_from_slice(&chunk);
+    }
+    body
+}
+
 fn body_from(content: Vec<u8>, chunk_size: usize) -> tokio::sync::mpsc::Receiver<Vec<u8>> {
     let (sender, receiver) = tokio::sync::mpsc::channel(4);
 
@@ -78,10 +88,11 @@ async fn host_is_signed_as_sent_for_a_plain_http_endpoint() {
     let server = FakeS3::start().await;
     let client = server.client();
 
-    client
+    let stream = client
         .download_file("my-bucket", "hello.txt")
         .await
         .unwrap();
+    read_to_end(stream).await;
 
     let captured = server.captured();
     assert!(captured[0].signature_valid);
@@ -1883,7 +1894,8 @@ async fn no_other_request_grew_a_body() {
     let client = server.client_in_region("eu-west-1");
 
     server.push_reply(200, "contents");
-    client.download_file("my-bucket", "a.bin").await.unwrap();
+    let stream = client.download_file("my-bucket", "a.bin").await.unwrap();
+    read_to_end(stream).await;
 
     server.push_reply(204, "");
     client.delete_file("my-bucket", "a.bin").await.unwrap();
@@ -2046,9 +2058,9 @@ async fn a_head_is_followed_by_a_working_request() {
     assert!(client.check_if_bucket_exists("my-bucket").await.unwrap());
 
     server.push_reply(200, "file contents");
-    let body = client.download_file("my-bucket", "a.bin").await.unwrap();
+    let stream = client.download_file("my-bucket", "a.bin").await.unwrap();
 
-    assert_eq!(body, b"file contents");
+    assert_eq!(read_to_end(stream).await, b"file contents");
     assert_eq!(server.request_count(), 2);
 }
 
@@ -2107,7 +2119,8 @@ async fn every_verb_survives_debug_mode() {
         .unwrap();
 
     server.push_reply(200, "contents");
-    client.download_file("my-bucket", "a.bin").await.unwrap();
+    let stream = client.download_file("my-bucket", "a.bin").await.unwrap();
+    read_to_end(stream).await;
 
     server.push_reply(204, "");
     client.delete_file("my-bucket", "a.bin").await.unwrap();
@@ -2239,13 +2252,13 @@ async fn download_returns_the_body() {
 
     server.push_reply(200, "file contents");
 
-    let body = client.download_file("my-bucket", "a.bin").await.unwrap();
+    let stream = client.download_file("my-bucket", "a.bin").await.unwrap();
 
-    assert_eq!(body, b"file contents");
+    assert_eq!(read_to_end(stream).await, b"file contents");
     assert_eq!(server.captured()[0].method, "GET");
 }
 
-/// `download_file` is asked for the whole object, so it reads one of any size: this
+/// `download_file` is asked for the whole object, so it delivers one of any size: this
 /// crate puts no limit on it. 11 MB is past the 10 MB a buffered read of FlUrl used to
 /// be refused at by default.
 #[tokio::test]
@@ -2256,19 +2269,10 @@ async fn download_reads_an_object_of_any_size() {
     let content = pattern(11 * 1024 * 1024);
     server.put_object("my-bucket", "big.bin", content.clone());
 
-    let body = client.download_file("my-bucket", "big.bin").await.unwrap();
+    let stream = client.download_file("my-bucket", "big.bin").await.unwrap();
+    let body = read_to_end(stream).await;
 
     assert!(body == content, "got {} bytes", body.len());
-}
-
-/// A range comes back as a stream; this is what a caller that wants it as one `Vec<u8>`
-/// writes.
-async fn read_to_end(mut stream: my_s3::S3DownloadStream) -> Vec<u8> {
-    let mut body = Vec::new();
-    while let Some(chunk) = stream.get_next_chunk().await.unwrap() {
-        body.extend_from_slice(&chunk);
-    }
-    body
 }
 
 /// `Range` is not in SignedHeaders, so it is added after signing - this checks that
@@ -2713,7 +2717,7 @@ async fn a_streamed_download_delivers_the_whole_object() {
     server.push_reply(200, "the whole object, one chunk or several");
 
     let mut stream = client
-        .download_file_as_stream("my-bucket", "a.bin")
+        .download_file("my-bucket", "a.bin")
         .await
         .unwrap();
 
@@ -2741,7 +2745,7 @@ async fn a_streamed_download_carries_the_length_and_the_type() {
     server.push_reply(200, "0123456789");
 
     let stream = client
-        .download_file_as_stream("my-bucket", "a.bin")
+        .download_file("my-bucket", "a.bin")
         .await
         .unwrap();
 
@@ -2759,7 +2763,7 @@ async fn a_streamed_download_of_a_missing_key_is_typed() {
     server.push_reply(404, no_such_key_xml());
 
     let err = client
-        .download_file_as_stream("my-bucket", "missing.bin")
+        .download_file("my-bucket", "missing.bin")
         .await
         .unwrap_err();
 
@@ -2777,7 +2781,7 @@ async fn a_body_that_ends_early_is_an_error_not_a_short_file() {
     server.push_truncated_reply("truncated", 64);
 
     let mut stream = client
-        .download_file_as_stream("my-bucket", "a.bin")
+        .download_file("my-bucket", "a.bin")
         .await
         .unwrap();
 
@@ -2814,7 +2818,7 @@ async fn a_streamed_download_survives_debug_mode() {
     server.push_reply(200, "contents");
 
     let mut stream = client
-        .download_file_as_stream("my-bucket", "a.bin")
+        .download_file("my-bucket", "a.bin")
         .await
         .unwrap();
 
@@ -3452,7 +3456,6 @@ fn client_futures_are_send() {
         assert_send(handle.finish());
         assert_send(client.download_file(bucket_name, key));
         assert_send(client.download_file_range(bucket_name, key, 0, None));
-        assert_send(client.download_file_as_stream(bucket_name, key));
         assert_send(stream.get_next_chunk());
         assert_send(client.open_reader(bucket_name, key));
         assert_send(client.get_object_size(bucket_name, key));

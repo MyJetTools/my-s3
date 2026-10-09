@@ -1,12 +1,12 @@
 use crate::S3Error;
 
-/// An object's body, handed over a chunk at a time instead of as one `Vec<u8>`.
+/// An object's body - or a range of it - handed over a chunk at a time instead of as one
+/// `Vec<u8>`, as [`S3Client::download_file`](crate::S3Client::download_file) and
+/// [`S3Client::download_file_range`](crate::S3Client::download_file_range) return it.
 ///
-/// [`S3Client::download_file`](crate::S3Client::download_file) has to hold the whole
-/// object in memory before the caller sees the first byte of it, which is fine for a
-/// settings file and is a way to be killed by the OOM killer for a video. This is the
-/// other shape: peak memory is one chunk, whatever the object's size, so a server can
-/// forward an object it could never hold.
+/// Peak memory is one chunk, whatever the object's size, so a server can forward an
+/// object it could never hold. A caller that wants the whole body in memory reads the
+/// stream to the end and collects it.
 ///
 /// The connection is checked out for as long as this value lives. Read it to the end -
 /// `get_next_chunk` returning `Ok(None)` - and the connection goes back to the pool;
@@ -15,7 +15,7 @@ use crate::S3Error;
 ///
 /// ```no_run
 /// # async fn doc(s3: &my_s3::S3Client) -> Result<(), my_s3::S3Error> {
-/// let mut stream = s3.download_file_as_stream("my-bucket", "video.mp4").await?;
+/// let mut stream = s3.download_file("my-bucket", "video.mp4").await?;
 ///
 /// // Both are what an HTTP response would need in order to forward this.
 /// let _ = stream.content_length;

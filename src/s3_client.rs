@@ -31,12 +31,6 @@ const NO_VALUE: Option<&str> = None;
 /// fails with `FlUrlError::ResponseBodyTooLarge` instead of being held.
 const MAX_ANSWER_SIZE: usize = 10 * 1024 * 1024;
 
-/// An object read into memory has no limit of this crate's: [`S3Client::download_file`]
-/// is asked for the whole object, and a cap here would only make the size of objects it
-/// can fetch an arbitrary constant. An object too big to hold is read with
-/// [`S3Client::download_file_as_stream`] or [`S3Client::open_reader`].
-const MAX_OBJECT_SIZE: usize = usize::MAX;
-
 /// `Clone` because [`Self::open_reader`] hands one to every [`S3Reader`]: the ranged
 /// `GET`s a reader issues are `'static` futures, so they cannot borrow the client they
 /// came from - and so does [`Self::start_upload`], for the task its request runs on. The
@@ -639,14 +633,46 @@ impl S3Client {
         (writer, handle)
     }
 
-    pub async fn download_file(&self, bucket_name: &str, key: &str) -> Result<Vec<u8>, S3Error> {
-        let mut response = self.open_object(bucket_name, key, None).await?;
+    /// Downloads an object - `GET /{bucket}/{key}`, body left on the socket.
+    ///
+    /// This returns as soon as the response *head* has arrived, and hands the body over a
+    /// chunk at a time: peak memory is one chunk whatever the object's size, so an HTTP
+    /// server can forward an object it could never hold. A caller that wants the object as
+    /// one `Vec<u8>` reads the stream to the end.
+    ///
+    /// The returned [`S3DownloadStream`] carries `Content-Length` and `Content-Type`,
+    /// which is what forwarding it needs, and holds the connection until it is read to
+    /// the end or dropped.
+    ///
+    /// A failure is still reported as a typed error: a non-2xx answer's body is small -
+    /// it is the `<Error><Code>` - so it *is* read, and only a successful one is left
+    /// streaming.
+    ///
+    /// ```no_run
+    /// # async fn doc(s3: &my_s3::S3Client) -> Result<(), my_s3::S3Error> {
+    /// use tokio::io::AsyncWriteExt;
+    ///
+    /// let mut stream = s3.download_file("my-bucket", "video.mp4").await?;
+    /// let mut file = tokio::fs::File::create("video.mp4").await.unwrap();
+    ///
+    /// while let Some(chunk) = stream.get_next_chunk().await? {
+    ///     file.write_all(&chunk).await.unwrap();
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn download_file(
+        &self,
+        bucket_name: &str,
+        key: &str,
+    ) -> Result<S3DownloadStream, S3Error> {
+        let response = self.open_object(bucket_name, key, None).await?;
 
-        Ok(response.get_body()?.into_vec(MAX_OBJECT_SIZE).await?)
+        S3DownloadStream::from_response(response)
     }
 
     /// Downloads a byte range of an object, handed over as a stream - the same
-    /// [`S3DownloadStream`] [`Self::download_file_as_stream`] returns, with
+    /// [`S3DownloadStream`] [`Self::download_file`] returns, with
     /// `content_length` being the length of the range. A caller that wants the range as
     /// one `Vec<u8>` reads the stream to the end.
     ///
@@ -968,45 +994,6 @@ impl S3Client {
         let body = self.read_success_body(response).await?;
 
         crate::list_objects::parse_list_objects_v2(&body)
-    }
-
-    /// Downloads an object without holding it in memory - `GET /{bucket}/{key}`, body
-    /// left on the socket.
-    ///
-    /// [`Self::download_file`] reads the whole object before it returns, so peak memory
-    /// is the object's size and a large one takes the process with it. This returns as
-    /// soon as the response *head* has arrived, and hands the body over a chunk at a
-    /// time, so an HTTP server can forward an object it could never hold.
-    ///
-    /// The returned [`S3DownloadStream`] carries `Content-Length` and `Content-Type`,
-    /// which is what forwarding it needs, and holds the connection until it is read to
-    /// the end or dropped.
-    ///
-    /// A failure is still reported as a typed error: a non-2xx answer's body is small -
-    /// it is the `<Error><Code>` - so it *is* read, and only a successful one is left
-    /// streaming.
-    ///
-    /// ```no_run
-    /// # async fn doc(s3: &my_s3::S3Client) -> Result<(), my_s3::S3Error> {
-    /// use tokio::io::AsyncWriteExt;
-    ///
-    /// let mut stream = s3.download_file_as_stream("my-bucket", "video.mp4").await?;
-    /// let mut file = tokio::fs::File::create("video.mp4").await.unwrap();
-    ///
-    /// while let Some(chunk) = stream.get_next_chunk().await? {
-    ///     file.write_all(&chunk).await.unwrap();
-    /// }
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn download_file_as_stream(
-        &self,
-        bucket_name: &str,
-        key: &str,
-    ) -> Result<S3DownloadStream, S3Error> {
-        let response = self.open_object(bucket_name, key, None).await?;
-
-        S3DownloadStream::from_response(response)
     }
 
     /// An object's size, without downloading it - `HEAD /{bucket}/{key}`, read out of

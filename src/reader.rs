@@ -37,7 +37,7 @@ use crate::{S3Client, S3Error};
 /// 16 KiB, and the object is never held in memory whatever its size.
 ///
 /// That also means this is the wrong shape for reading an object front to back in small
-/// pieces - that is one request per piece. [`S3Client::download_file_as_stream`] is the
+/// pieces - that is one request per piece. [`S3Client::download_file`] is the
 /// shape for that.
 ///
 /// # One reader is one position
